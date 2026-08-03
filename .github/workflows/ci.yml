@@ -84,7 +84,11 @@ jobs:
         run: bandit -r src/ -c pyproject.toml
 
       - name: pip-audit
-        run: pip-audit --strict --desc
+        # Audit the project's declared dependencies, not the installed
+        # environment. The environment contains dnsdrift itself as an editable
+        # install, which pip-audit cannot resolve on PyPI, and --strict treats
+        # an unauditable package as a hard failure.
+        run: pip-audit --strict --desc on .
 
   smoke:
     name: end-to-end smoke test
