@@ -95,7 +95,7 @@ git log --oneline    # expect 3 commits
 git status           # expect "nothing to commit, working tree clean"
 ```
 
-After the push, the repo should show 39 files and CI should start within a
+After the push, the repo should show 41 files and CI should start within a
 minute under the Actions tab.
 
 ---
