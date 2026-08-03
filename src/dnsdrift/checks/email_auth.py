@@ -62,6 +62,11 @@ def check_spf(ctx: CheckContext) -> CheckResult:
     except DNSError as exc:
         return _error("spf", domain, str(exc))
 
+    if answer.truncated:
+        # A partial TXT set could be missing the SPF record entirely, which
+        # would surface as "No SPF record" and then as "SPF record was removed".
+        return _error("spf", domain, "TXT answer was truncated; refusing to record a partial record set")
+
     records = [r for r in answer.records if r.lower().startswith("v=spf1")]
     observations: dict[str, object] = {
         "record_count": len(records),
@@ -119,8 +124,13 @@ def check_spf(ctx: CheckContext) -> CheckResult:
     observations["all_qualifier"] = qualifier
     lookups = _count_spf_lookups(terms)
     observations["dns_lookups"] = lookups
+    # RFC 7208 §6.1: redirect= is a terminator in its own right and is mutually
+    # exclusive with `all`. Demanding `all` alongside it is a false positive on
+    # a very common enterprise pattern (v=spf1 redirect=_spf.provider.com).
+    has_redirect = any(t.lstrip("+-~?").lower().startswith("redirect=") for t in terms)
+    observations["redirect"] = has_redirect
 
-    if all_term is None:
+    if all_term is None and not has_redirect:
         findings.append(
             Finding(
                 domain=domain,
@@ -205,7 +215,7 @@ def check_spf(ctx: CheckContext) -> CheckResult:
             )
         )
 
-    if any(t.lower().startswith("ptr") for t in terms):
+    if any(t.lstrip("+-~?").lower().startswith("ptr") for t in terms):
         findings.append(
             Finding(
                 domain=domain,
@@ -252,6 +262,14 @@ def _count_spf_lookups(terms: list[str]) -> int:
 
 _DMARC_TAG_RE = re.compile(r"^\s*([a-z]+)\s*=\s*(.*?)\s*$", re.IGNORECASE)
 
+# The version tag must be exactly DMARC1, terminated by a separator or the end
+# of the record. A prefix match would accept "v=DMARC12345".
+_DMARC_VERSION_RE = re.compile(r"^\s*v\s*=\s*DMARC1\s*(;|$)", re.IGNORECASE)
+
+
+def _is_dmarc_record(record: str) -> bool:
+    return bool(_DMARC_VERSION_RE.match(record))
+
 
 @register("dmarc")
 def check_dmarc(ctx: CheckContext) -> CheckResult:
@@ -262,7 +280,7 @@ def check_dmarc(ctx: CheckContext) -> CheckResult:
     except DNSError as exc:
         return _error("dmarc", domain, str(exc))
 
-    records = [r for r in answer.records if r.lower().replace(" ", "").startswith("v=dmarc1")]
+    records = [r for r in answer.records if _is_dmarc_record(r)]
     observations: dict[str, object] = {"record_count": len(records), "record": None, "tags": {}}
     findings: list[Finding] = []
 
@@ -321,7 +339,7 @@ def check_dmarc(ctx: CheckContext) -> CheckResult:
                 domain=domain,
                 check="dmarc",
                 kind=FindingKind.POSTURE,
-                severity=Severity.HIGH if policy == "none" else Severity.CRITICAL,
+                severity=Severity.HIGH,
                 title=f"DMARC policy is {'p=none' if policy == 'none' else 'missing'}",
                 detail=(
                     "p=none is monitor-only: failing mail is still delivered. Spoofed mail "
@@ -384,6 +402,24 @@ def check_dmarc(ctx: CheckContext) -> CheckResult:
     try:
         pct = int(pct_raw)
     except (TypeError, ValueError):
+        pct = 100
+    if not 0 <= pct <= 100:
+        # Out of range is a malformed tag. Receivers fall back to the default,
+        # and recording the raw value would let pct=150 -> pct=100 read as a
+        # reduction on the next scan.
+        findings.append(
+            Finding(
+                domain=domain,
+                check="dmarc",
+                kind=FindingKind.POSTURE,
+                severity=Severity.LOW,
+                title=f"DMARC pct value is out of range (pct={pct})",
+                detail="RFC 7489 restricts pct to 0-100; receivers ignore the tag and apply the policy in full.",
+                remediation="Correct or remove the pct= tag.",
+                evidence={"record": record},
+                references=(RFC_DMARC,),
+            )
+        )
         pct = 100
     observations["pct"] = pct
     if policy in ("quarantine", "reject") and pct < 100:
@@ -448,12 +484,15 @@ def check_dkim(ctx: CheckContext) -> CheckResult:
     findings: list[Finding] = []
     errors = 0
 
+    errored_selectors: list[str] = []
+
     for selector in ctx.domain.dkim_selectors:
         qname = f"{selector}._domainkey.{domain}"
         try:
             answer = ctx.resolver.txt(qname)
         except DNSError:
             errors += 1
+            errored_selectors.append(selector)
             continue
 
         record = next((r for r in answer.records if "p=" in r.lower() or "v=dkim1" in r.lower()), None)
@@ -464,7 +503,7 @@ def check_dkim(ctx: CheckContext) -> CheckResult:
         entry: dict[str, object] = {
             "present": True,
             "revoked": key_material == "",
-            "key_type": _dkim_tag(record, "k") or "rsa",
+            "key_type": (_dkim_tag(record, "k") or "rsa").lower(),
             "key_length_b64": len(key_material) if key_material else 0,
         }
         found[selector] = entry
@@ -528,6 +567,7 @@ def check_dkim(ctx: CheckContext) -> CheckResult:
     observations: dict[str, object] = {
         "selectors_probed": list(ctx.domain.dkim_selectors),
         "selectors_found": sorted(found),
+        "selectors_errored": sorted(errored_selectors),
         "details": found,
     }
 
@@ -551,8 +591,25 @@ def check_dkim(ctx: CheckContext) -> CheckResult:
         )
 
     result = CheckResult(check="dkim", domain=domain, observations=observations, findings=findings)
-    if errors and not found:
-        result.error = f"{errors} DKIM selector lookups failed"
+    if errors:
+        # `selectors_found` is incomplete, but discarding the whole observation
+        # would mean a domain with one persistently flaky selector never builds
+        # a baseline and never gets DKIM drift detection. The failed selectors
+        # are recorded and `_dkim_drift` excludes exactly those instead.
+        findings.append(
+            Finding(
+                domain=domain,
+                check="dkim",
+                kind=FindingKind.OPERATIONAL,
+                severity=Severity.LOW,
+                title=f"{errors} DKIM selector lookup(s) could not complete",
+                detail=(
+                    f"Could not query: {', '.join(errored_selectors[:5])}. These selectors are "
+                    "excluded from change detection this run rather than assumed absent."
+                ),
+                remediation="Re-run the scan. If it persists, check resolver reachability.",
+            )
+        )
     return result
 
 
@@ -583,6 +640,9 @@ def check_mx(ctx: CheckContext) -> CheckResult:
         answer = ctx.resolver.query(domain, "MX")
     except DNSError as exc:
         return _error("mx", domain, str(exc))
+
+    if answer.truncated:
+        return _error("mx", domain, "MX answer was truncated; refusing to record a partial record set")
 
     hosts = tuple(sorted(answer.records))
     null_mx = hosts == ("0 .",) or any(r.strip().endswith(" .") and r.strip().startswith("0") for r in hosts)

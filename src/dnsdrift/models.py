@@ -134,6 +134,15 @@ class CheckResult:
     observations: dict[str, Any] = field(default_factory=dict)
     findings: list[Finding] = field(default_factory=list)
     error: str | None = None
+    partial: bool = False
+    """Observations are correct but describe only part of the picture.
+
+    A partial result is *merged over* the previous baseline instead of
+    replacing it. The TLS check uses this when a host stops answering:
+    ``reachable: False`` is a true and useful observation, but writing it as a
+    whole snapshot would discard the recorded issuer and SAN list, so a later
+    recovery with a different certificate would go unnoticed.
+    """
 
     @property
     def ok(self) -> bool:
@@ -191,6 +200,25 @@ class ScanReport:
     findings: list[Finding] = field(default_factory=list)
     baseline_available: bool = False
     ai_summary: str | None = None
+    checks_run: int = 0
+    checks_failed: int = 0
+
+    @property
+    def scan_degraded(self) -> bool:
+        """True when enough checks failed that the result cannot be trusted.
+
+        A monitoring tool that exits 0 because nothing could be checked is worse
+        than one that fails loudly: the pipeline goes green and everyone assumes
+        the domains are clean.
+        """
+        if self.checks_run == 0:
+            # Nothing was attempted (e.g. an empty check selection). That is not
+            # a degraded scan, and reporting it as one would fail `dnsdrift
+            # check` runs that simply had nothing to do.
+            return False
+        # A floor of 3 keeps a single flaky lookup in a one- or two-check run
+        # from tripping the whole scan.
+        return self.checks_run >= 3 and self.checks_failed * 2 > self.checks_run
 
     @property
     def max_severity(self) -> Severity | None:
@@ -212,6 +240,9 @@ class ScanReport:
             "finished_at": self.finished_at,
             "baseline_available": self.baseline_available,
             "domains_scanned": len(self.snapshots),
+            "checks_run": self.checks_run,
+            "checks_failed": self.checks_failed,
+            "scan_degraded": self.scan_degraded,
             "counts_by_severity": self.counts_by_severity(),
             "findings": [f.to_dict() for f in self.findings],
             "snapshots": [s.to_dict() for s in self.snapshots],

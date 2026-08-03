@@ -10,14 +10,24 @@ verification deliberately, and compensates:
   certificate is read, the socket closes;
 * nothing retrieved over it is trusted, executed, or forwarded anywhere;
 * validity is then evaluated in code, from the certificate itself, rather than
-  being delegated to the handshake.
+  being delegated to the handshake;
+* the connection is made to an address that was already confirmed public, not
+  by re-resolving the hostname, so DNS rebinding cannot redirect it inward.
 
 This is the standard pattern for a certificate scanner. It is confined to this
 module; :mod:`dnsdrift.httpclient`, which carries actual data, always verifies.
+
+Every string lifted out of a certificate is passed through :func:`_safe_text`
+before it reaches an observation. Certificate subjects and SANs are wholly
+attacker-chosen for any host you do not control — and in the takeover scenario
+this tool exists to detect, the host *is* the attacker. Those strings end up in
+Markdown reports, Slack messages and the LLM prompt, so newlines and control
+characters are stripped at the source rather than at each sink.
 """
 
 from __future__ import annotations
 
+import re
 import socket
 import ssl
 from datetime import datetime, timezone
@@ -37,6 +47,21 @@ _WEAK_SIGNATURE_HASHES = {"md5", "sha1"}
 _MIN_RSA_BITS = 2048
 _MIN_EC_BITS = 256
 
+_MAX_CERT_FIELD_LENGTH = 256
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+# A DNS name in a SAN should look like a DNS name. Anything else is either a
+# malformed certificate or a deliberate injection attempt.
+_DNS_NAME_RE = re.compile(r"^[A-Za-z0-9._*-]{1,253}$")
+
+
+def _safe_text(value: str) -> str:
+    """Neutralise a certificate-derived string for downstream rendering."""
+    cleaned = _CONTROL_CHARS_RE.sub(" ", str(value))
+    cleaned = " ".join(cleaned.split())
+    if len(cleaned) > _MAX_CERT_FIELD_LENGTH:
+        cleaned = cleaned[: _MAX_CERT_FIELD_LENGTH - 1] + "…"
+    return cleaned
+
 
 @register("tls")
 def check_tls(ctx: CheckContext) -> CheckResult:
@@ -45,15 +70,16 @@ def check_tls(ctx: CheckContext) -> CheckResult:
     findings: list[Finding] = []
 
     try:
-        # Refuse to open a socket to a domain that resolves internally. Without
-        # this, a config entry could aim the scanner at an internal service.
-        resolve_public_ips(host, port=443)
+        # Refuse to open a socket to a domain that resolves internally, and keep
+        # the addresses so the connection below does not re-resolve.
+        addresses = resolve_public_ips(host, port=443)
     except ValidationError as exc:
+        # We could not even attempt the check — a tool error, not an observation
+        # about the domain. No observations are recorded.
         return CheckResult(
             check="tls",
             domain=domain,
             error=str(exc),
-            observations={"host": host, "reachable": False},
             findings=[
                 Finding(
                     domain=domain,
@@ -61,7 +87,7 @@ def check_tls(ctx: CheckContext) -> CheckResult:
                     kind=FindingKind.OPERATIONAL,
                     severity=Severity.LOW,
                     title="TLS check skipped",
-                    detail=str(exc),
+                    detail=_safe_text(str(exc)),
                     remediation="Confirm the domain is publicly resolvable.",
                 )
             ],
@@ -69,28 +95,52 @@ def check_tls(ctx: CheckContext) -> CheckResult:
 
     try:
         der, negotiated_protocol, negotiated_cipher = _fetch_peer_certificate(
-            host, timeout=ctx.settings.timeout_seconds
+            host, addresses[0], timeout=ctx.settings.timeout_seconds
         )
     except (OSError, ssl.SSLError) as exc:
+        # The host resolves publicly but will not complete a handshake. That is
+        # a determinate fact about the domain, so it IS recorded — which is what
+        # lets the drift engine notice an HTTPS service going away.
         return CheckResult(
             check="tls",
             domain=domain,
-            error=f"could not establish TLS connection to {host}:443: {exc}",
             observations={"host": host, "reachable": False},
+            # Partial: true as far as it goes, but it says nothing about the
+            # certificate. Merging preserves the recorded issuer/SANs so that a
+            # recovery with a *different* certificate still registers as drift.
+            partial=True,
             findings=[
                 Finding(
                     domain=domain,
                     check="tls",
-                    kind=FindingKind.OPERATIONAL,
+                    kind=FindingKind.POSTURE,
                     severity=Severity.INFO,
                     title="No TLS service on port 443",
-                    detail=f"Could not complete a TLS handshake with {host}:443 ({exc}).",
+                    detail=f"Could not complete a TLS handshake with {host}:443 ({_safe_text(str(exc))}).",
                     remediation="If this host is meant to serve HTTPS, investigate; otherwise ignore.",
                 )
             ],
         )
 
-    cert = x509.load_der_x509_certificate(der)
+    try:
+        cert = x509.load_der_x509_certificate(der)
+    except ValueError as exc:
+        return CheckResult(
+            check="tls",
+            domain=domain,
+            error=f"peer at {host}:443 presented an unparseable certificate: {exc}",
+            findings=[
+                Finding(
+                    domain=domain,
+                    check="tls",
+                    kind=FindingKind.POSTURE,
+                    severity=Severity.HIGH,
+                    title="TLS certificate could not be parsed",
+                    detail=f"{host}:443 presented a malformed certificate ({_safe_text(str(exc))}).",
+                    remediation="Inspect what is actually being served on port 443.",
+                )
+            ],
+        )
 
     not_after = _aware(
         cert.not_valid_after_utc if hasattr(cert, "not_valid_after_utc") else cert.not_valid_after
@@ -99,10 +149,10 @@ def check_tls(ctx: CheckContext) -> CheckResult:
         cert.not_valid_before_utc if hasattr(cert, "not_valid_before_utc") else cert.not_valid_before
     )
     now = datetime.now(timezone.utc)
-    days_left = (not_after - now).days
+    days_left = int((not_after - now).total_seconds() // 86400)
 
-    issuer = _common_name(cert.issuer) or cert.issuer.rfc4514_string()
-    subject = _common_name(cert.subject) or cert.subject.rfc4514_string()
+    issuer = _safe_text(_common_name(cert.issuer) or cert.issuer.rfc4514_string())
+    subject = _safe_text(_common_name(cert.subject) or cert.subject.rfc4514_string())
     sans = _subject_alt_names(cert)
     sig_hash = _signature_hash_name(cert)
     key_type, key_bits = _public_key_info(cert)
@@ -134,7 +184,7 @@ def check_tls(ctx: CheckContext) -> CheckResult:
                 check="tls",
                 kind=FindingKind.POSTURE,
                 severity=Severity.CRITICAL,
-                title=f"TLS certificate expired {abs(days_left)} days ago",
+                title="TLS certificate has expired",
                 detail=f"The certificate for {host} expired on {not_after.date().isoformat()}.",
                 remediation="Renew and deploy the certificate immediately.",
                 evidence={"not_after": not_after.isoformat(), "issuer": issuer},
@@ -191,10 +241,10 @@ def check_tls(ctx: CheckContext) -> CheckResult:
                 title="TLS certificate does not cover this hostname",
                 detail=(
                     f"{host} is not present in the certificate's subject alternative names "
-                    f"({', '.join(sans) or 'none'}). Browsers will reject this connection."
+                    f"({', '.join(sans[:10]) or 'none'}). Browsers will reject this connection."
                 ),
                 remediation=f"Reissue the certificate including {host} as a SAN.",
-                evidence={"host": host, "subject_alt_names": sans},
+                evidence={"host": host, "subject_alt_names": sans[:50]},
             )
         )
 
@@ -274,8 +324,13 @@ def check_tls(ctx: CheckContext) -> CheckResult:
     return CheckResult(check="tls", domain=domain, observations=observations, findings=findings)
 
 
-def _fetch_peer_certificate(host: str, *, timeout: float) -> tuple[bytes, str, str]:
-    """Complete a handshake with *host* and return its certificate.
+def _fetch_peer_certificate(host: str, address: str, *, timeout: float) -> tuple[bytes, str, str]:
+    """Complete a handshake with *address* and return its certificate.
+
+    Connects to the already-validated *address* rather than to *host*, so the
+    name cannot resolve to something different between the public-address check
+    and the connect (DNS rebinding). *host* is still sent as SNI so the server
+    returns the right certificate.
 
     Verification is disabled on purpose (see the module docstring): an expired
     or mismatched certificate is precisely what this check reports on, and a
@@ -286,7 +341,7 @@ def _fetch_peer_certificate(host: str, *, timeout: float) -> tuple[bytes, str, s
     # Verification is off by design (see module docstring): an expired or
     # mismatched certificate is exactly what this check exists to report, and a
     # verifying context would abort before handing it over. Validity is then
-    # asserted in code below, from the certificate itself.
+    # asserted in code, from the certificate itself.
     context.check_hostname = False  # noqa: S501
     context.verify_mode = ssl.CERT_NONE  # noqa: S501
     # Allow old protocols so that a server still speaking TLS 1.0 can be
@@ -294,7 +349,7 @@ def _fetch_peer_certificate(host: str, *, timeout: float) -> tuple[bytes, str, s
     context.minimum_version = ssl.TLSVersion.TLSv1
     context.set_ciphers("DEFAULT:@SECLEVEL=1")
 
-    with socket.create_connection((host, 443), timeout=timeout) as raw:
+    with socket.create_connection((address, 443), timeout=timeout) as raw:
         raw.settimeout(timeout)
         with context.wrap_socket(raw, server_hostname=host) as tls:
             der = tls.getpeercert(binary_form=True)
@@ -316,6 +371,7 @@ def _common_name(name: x509.Name) -> str | None:
 
 
 def _subject_alt_names(cert: x509.Certificate) -> list[str]:
+    """Return the DNS SANs, discarding anything that is not a plausible name."""
     try:
         ext = cert.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
     except x509.ExtensionNotFound:
@@ -323,7 +379,15 @@ def _subject_alt_names(cert: x509.Certificate) -> list[str]:
     san = ext.value
     if not isinstance(san, x509.SubjectAlternativeName):  # pragma: no cover - defensive
         return []
-    return sorted(n.lower() for n in san.get_values_for_type(x509.DNSName))
+
+    names: list[str] = []
+    for raw in san.get_values_for_type(x509.DNSName):
+        candidate = str(raw).strip().lower()
+        # Anything failing the DNS grammar is malformed or an injection attempt.
+        # Keeping a sanitised placeholder preserves the count without carrying
+        # the payload into a report or a Slack message.
+        names.append(candidate if _DNS_NAME_RE.match(candidate) else "<invalid-dns-name>")
+    return sorted(set(names))
 
 
 def _signature_hash_name(cert: x509.Certificate) -> str:
@@ -356,6 +420,10 @@ def _hostname_matches(host: str, subject_cn: str | None, sans: list[str]) -> boo
             return True
         if name.startswith("*."):
             suffix = name[1:]  # ".example.com"
+            # A wildcard must span at least two labels below the root; "*.com"
+            # is not a legitimate certificate name.
+            if suffix.count(".") < 2:
+                continue
             if not host.endswith(suffix):
                 continue
             # A wildcard matches exactly one label, so "*.example.com" covers

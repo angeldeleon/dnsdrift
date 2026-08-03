@@ -66,7 +66,7 @@ First run writes the baseline and reports posture only. Subsequent runs report d
 | `mx` | Mail routing, missing null MX on non-mail domains |
 | `dnssec` | DS at parent, DS-present-without-DNSKEY (breaks validating resolvers) |
 | `caa` | CA restrictions, missing `iodef` |
-| `cname` | Dangling CNAMEs on 14 common subdomains, matched against 29 takeover-prone providers |
+| `cname` | CNAMEs pointing at NXDOMAIN targets on 14 common subdomains, matched against 29 takeover-prone providers |
 | `tls` | Expiry, self-signed, hostname mismatch, weak key/signature, TLS 1.1 and below |
 | `ct` | New certificates in Certificate Transparency logs |
 
@@ -131,9 +131,9 @@ Webhook URLs and API keys are read from the environment. The config only names t
 |---|---|
 | 0 | Completed, nothing at or above `fail_on` |
 | 1 | Completed, findings at or above `fail_on` |
-| 2 | Could not run (bad config, unwritable state) |
+| 2 | Could not run, or ran degraded (bad config, unwritable state, or over half the checks failed) |
 
-1 and 2 are separate on purpose. If CI treats them the same, the pipeline eventually goes green because the scanner broke rather than because the domains are clean.
+1 and 2 are separate on purpose. If CI treats them the same, the pipeline eventually goes green because the scanner broke rather than because the domains are clean. For the same reason, a run where most checks failed exits 2 rather than reporting a clean 0 — "nothing found" and "nothing checked" must not look alike.
 
 ## Optional AI summary
 
@@ -163,12 +163,13 @@ The TLS check opens its inspection socket with verification disabled. This is re
 Worth knowing before you rely on it:
 
 - **SPF lookup counts are approximate.** Mechanisms in the record are counted; `include:` chains are not expanded. Resolving them is a lookup per include and a hostile record can turn that into an amplification vector. The count under-reports.
-- **DKIM absence proves nothing.** Selectors can't be enumerated from DNS. The default list covers common providers; put your real selectors in the config or the check is close to useless.
-- **CNAME probing is shallow.** 14 hardcoded subdomain labels, not enumeration. Use a dedicated tool for full subdomain discovery.
+- **DKIM absence proves nothing.** Selectors can't be enumerated from DNS. The default list covers common providers; put your real selectors in the config or the check is close to useless. A selector whose lookup fails is recorded as indeterminate and excluded from change detection rather than reported as removed.
+- **CNAME probing is shallow.** 14 hardcoded subdomain labels, not enumeration. Use a dedicated tool for full subdomain discovery. Only NXDOMAIN targets are reported — a target that exists but serves no addresses isn't claimable, and one that can't be resolved at all is recorded as unknown rather than guessed at.
 - **Takeover fingerprinting is heuristic.** A match against the provider list raises severity. Absence from the list doesn't mean a dangling record is safe.
-- **crt.sh is best-effort.** No SLA. Failures are reported at `info` and don't fail the scan.
+- **crt.sh is best-effort.** No SLA. Failures are reported at `info` and don't fail the scan. For domains with more than ~200 certificate names the tracked list is a capped window, and drift comparison is skipped rather than reporting window churn as new hostnames.
 - **Resolver answers are trusted.** No DNSSEC validation is performed locally. Set `settings.resolvers` to a validating resolver you control if that matters.
-- **SSRF guard is TOCTOU-vulnerable.** DNS can change between validation and connection. Pinning the resolved address at connect time would close this; it isn't implemented.
+- **The webhook SSRF guard is TOCTOU-bounded.** DNS can change between validation and connection. The TLS check closes this by connecting to the already-validated address; the HTTP client does not pin, so a rebinding attack against a webhook host remains theoretically possible.
+- **DNSSEC is checked at the configured name.** A name that isn't a zone cut (`mail.example.com` rather than `example.com`) has no DS record of its own and will always read as unsigned. Configure apex domains.
 - **GitHub Actions are pinned to version tags, not SHAs.** Tracked as an open issue.
 
 ## Contributing

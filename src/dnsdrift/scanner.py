@@ -43,6 +43,8 @@ def scan(config: Config, store: SnapshotStore | None = None) -> ScanReport:
 
     snapshots: list[Snapshot] = []
     findings: list[Finding] = []
+    checks_run = 0
+    checks_failed = 0
 
     # One task per (domain, check) rather than per domain: a single domain with
     # nine checks would otherwise serialise onto one worker while others idle.
@@ -73,22 +75,31 @@ def scan(config: Config, store: SnapshotStore | None = None) -> ScanReport:
     for domain in config.domains:
         domain_results = results[domain.name]
         snapshot = Snapshot(domain=domain.name, collected_at=started)
+        previous = store.get(domain.name) if store else None
 
         for check_name in domain.checks:
             outcome = domain_results.get(check_name)
             if outcome is None:
                 continue
+            checks_run += 1
             findings.extend(outcome.findings)
             if outcome.error:
+                checks_failed += 1
                 snapshot.errors[check_name] = outcome.error
             # A check that errored has unreliable observations. Recording them
             # would make the next run diff good data against bad and emit
             # phantom drift, so failed checks contribute nothing to the
             # snapshot and simply leave the previous baseline in place.
             if outcome.ok and outcome.observations:
-                snapshot.checks[check_name] = outcome.observations
+                if outcome.partial and previous is not None:
+                    # Layer the partial observation over the last known-good one
+                    # so fields the check could not determine this run survive.
+                    merged = dict(previous.checks.get(check_name, {}))
+                    merged.update(outcome.observations)
+                    snapshot.checks[check_name] = merged
+                else:
+                    snapshot.checks[check_name] = outcome.observations
 
-        previous = store.get(domain.name) if store else None
         if previous is not None:
             baseline_available = True
             findings.extend(diff_snapshots(previous, snapshot))
@@ -110,6 +121,8 @@ def scan(config: Config, store: SnapshotStore | None = None) -> ScanReport:
         snapshots=snapshots,
         findings=findings,
         baseline_available=baseline_available,
+        checks_run=checks_run,
+        checks_failed=checks_failed,
     )
 
 

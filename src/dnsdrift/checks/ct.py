@@ -61,16 +61,23 @@ def check_ct(ctx: CheckContext) -> CheckResult:
         return _unavailable(domain, "crt.sh returned an unexpected payload shape")
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=lookback)
+    # Both caps below make `covered_names` a *window* rather than a complete
+    # set. When either bites, a name can enter or leave the window purely
+    # because another certificate expired, which the drift engine would report
+    # as a previously-unseen hostname. Flag it so drift skips the comparison.
+    entries_truncated = len(payload) > _MAX_ENTRIES
     entries = _parse_entries(payload[:_MAX_ENTRIES])
     recent = [e for e in entries if e["entry_timestamp"] and e["entry_timestamp"] >= cutoff.isoformat()]
 
     issuers = sorted({e["issuer"] for e in entries if e["issuer"]})
     all_names = sorted({name for e in entries for name in e["names"]})
 
+    names_truncated = len(all_names) > 200
     observations: dict[str, Any] = {
         "total_unexpired_certs": len(entries),
         "issuers": issuers,
         "covered_names": all_names[:200],
+        "names_truncated": entries_truncated or names_truncated,
         "recent_count": len(recent),
         # Deliberately excluded from the diff surface: the full recent list
         # changes on every renewal and would make every run look like drift.

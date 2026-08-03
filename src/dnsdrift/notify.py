@@ -9,6 +9,7 @@ without carrying a secret. Every destination URL goes through the SSRF guard in
 from __future__ import annotations
 
 import logging
+import re
 
 from .config import NotifyConfig
 from .httpclient import HTTPError, safe_request
@@ -19,6 +20,8 @@ log = logging.getLogger(__name__)
 
 # Slack rejects oversized payloads and truncates long messages awkwardly.
 _MAX_SLACK_FINDINGS = 20
+
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 _SEVERITY_EMOJI = {
     Severity.CRITICAL: ":rotating_light:",
@@ -128,13 +131,16 @@ def _post_slack(url: str, report: ScanReport, findings: list, *, user_agent: str
 
 
 def _escape(text: str) -> str:
-    """Escape Slack mrkdwn control characters.
+    """Neutralise attacker-influenced text before it reaches a Slack channel.
 
-    Domain and record values come from DNS, which is attacker-influenced for
-    any domain you do not control. Without escaping, a crafted TXT record could
-    inject formatting or a link into your alert channel.
+    Domain names, DNS record contents and certificate subjects are all
+    attacker-chosen for any domain you do not control. Escaping the mrkdwn
+    entities is not sufficient on its own: a newline lets a crafted value forge
+    an extra line in the alert (a fake ":white_circle: all checks passed", say),
+    so control characters are collapsed to spaces first.
     """
-    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    collapsed = " ".join(_CONTROL_CHARS_RE.sub(" ", str(text)).split())
+    return collapsed.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _truncate(text: str, limit: int) -> str:

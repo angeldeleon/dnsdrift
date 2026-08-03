@@ -32,8 +32,11 @@ log = logging.getLogger(__name__)
 # DMARC enforcement strength, for detecting downgrades.
 _DMARC_STRENGTH = {"": 0, "none": 1, "quarantine": 2, "reject": 3}
 
-# SPF 'all' qualifier strength.
-_SPF_STRENGTH = {"+": 0, "?": 1, "~": 2, "-": 3}
+# SPF 'all' qualifier strength. The empty string means the record has no `all`
+# mechanism at all, which RFC 7208 §4.7 evaluates as neutral — the same
+# effective strength as ?all. Excluding it would let "-all" -> "no all" pass as
+# a cosmetic change when it is a real weakening.
+_SPF_STRENGTH = {"": 1, "+": 0, "?": 1, "~": 2, "-": 3}
 
 DriftRule = Callable[[str, dict[str, Any], dict[str, Any]], list[Finding]]
 
@@ -157,6 +160,22 @@ def _dmarc_drift(domain: str, old: dict[str, Any], new: dict[str, Any]) -> list[
             )
         )
 
+    old_count = _as_int(old.get("record_count"), 0)
+    new_count = _as_int(new.get("record_count"), 0)
+    if new_count > 1 >= old_count:
+        findings.append(
+            _drift(
+                domain,
+                "dmarc",
+                Severity.HIGH,
+                f"DMARC went from {old_count} record to {new_count}",
+                "RFC 7489 §6.6.3 requires receivers to ignore the domain's DMARC policy "
+                "entirely when more than one record is published.",
+                "Remove the extra _dmarc TXT records, keeping exactly one.",
+                {"previous": old_count, "current": new_count},
+            )
+        )
+
     old_pct = _as_int(old.get("pct"), 100)
     new_pct = _as_int(new.get("pct"), 100)
     if new_pct < old_pct:
@@ -172,9 +191,15 @@ def _dmarc_drift(domain: str, old: dict[str, Any], new: dict[str, Any]) -> list[
             )
         )
 
+    record_removed = bool(old.get("record")) and not new.get("record")
+
     old_rua = str(old_tags.get("rua", ""))
     new_rua = str(new_tags.get("rua", ""))
-    if old_rua and not new_rua:
+    if record_removed:
+        # The CRITICAL "record was removed" finding above already covers this;
+        # a second MEDIUM about the reporting address is just noise.
+        pass
+    elif old_rua and not new_rua:
         findings.append(
             _drift(
                 domain,
@@ -229,13 +254,17 @@ def _spf_drift(domain: str, old: dict[str, Any], new: dict[str, Any]) -> list[Fi
     old_strength = _SPF_STRENGTH.get(old_qualifier, -1)
     new_strength = _SPF_STRENGTH.get(new_qualifier, -1)
 
-    if old_strength >= 0 and new_strength >= 0 and new_strength < old_strength:
+    # A record terminating in redirect= has no `all` by design, so comparing
+    # qualifiers across a redirect boundary would be meaningless.
+    redirect_involved = bool(old.get("redirect")) or bool(new.get("redirect"))
+
+    if not redirect_involved and old_strength >= 0 and new_strength >= 0 and new_strength < old_strength:
         findings.append(
             _drift(
                 domain,
                 "spf",
                 Severity.CRITICAL if new_qualifier == "+" else Severity.HIGH,
-                f"SPF policy weakened: {old_qualifier}all -> {new_qualifier}all",
+                f"SPF policy weakened: {old_qualifier or 'no '}all -> {new_qualifier or 'no '}all",
                 f"The SPF terminating mechanism on {domain} became more permissive.",
                 "Confirm the change was intentional; restore the stricter qualifier otherwise.",
                 {"previous": f"{old_qualifier}all", "current": f"{new_qualifier}all"},
@@ -255,6 +284,22 @@ def _spf_drift(domain: str, old: dict[str, Any], new: dict[str, Any]) -> list[Fi
                 "effectively stopped working for this domain.",
                 "Reduce include: mechanisms below the limit.",
                 {"previous": old_lookups, "current": new_lookups},
+            )
+        )
+
+    old_count = _as_int(old.get("record_count"), 0)
+    new_count = _as_int(new.get("record_count"), 0)
+    if new_count > 1 >= old_count:
+        findings.append(
+            _drift(
+                domain,
+                "spf",
+                Severity.HIGH,
+                f"SPF went from {old_count} record to {new_count}",
+                "RFC 7208 §4.5 requires exactly one v=spf1 record. With more than one, "
+                "receivers return permerror and stop evaluating SPF for this domain entirely.",
+                "Merge the records back into a single v=spf1 TXT record.",
+                {"previous": old_count, "current": new_count},
             )
         )
 
@@ -280,8 +325,12 @@ def _dkim_drift(domain: str, old: dict[str, Any], new: dict[str, Any]) -> list[F
     old_found = set(old.get("selectors_found") or [])
     new_found = set(new.get("selectors_found") or [])
 
-    removed = sorted(old_found - new_found)
-    added = sorted(new_found - old_found)
+    # A selector whose lookup failed on either side is indeterminate, not
+    # absent. Comparing it would report a timeout as "your DKIM key vanished".
+    indeterminate = set(old.get("selectors_errored") or []) | set(new.get("selectors_errored") or [])
+
+    removed = sorted(old_found - new_found - indeterminate)
+    added = sorted(new_found - old_found - indeterminate)
 
     if removed:
         findings.append(
@@ -314,7 +363,7 @@ def _dkim_drift(domain: str, old: dict[str, Any], new: dict[str, Any]) -> list[F
 
     old_details = old.get("details") or {}
     new_details = new.get("details") or {}
-    for selector in sorted(old_found & new_found):
+    for selector in sorted((old_found & new_found) - indeterminate):
         old_entry = old_details.get(selector) or {}
         new_entry = new_details.get(selector) or {}
         if not old_entry.get("revoked") and new_entry.get("revoked"):
@@ -443,9 +492,12 @@ def _caa_drift(domain: str, old: dict[str, Any], new: dict[str, Any]) -> list[Fi
 def _cname_drift(domain: str, old: dict[str, Any], new: dict[str, Any]) -> list[Finding]:
     findings: list[Finding] = []
 
+    # Names we could not resolve on either side are unknown, not changed.
+    indeterminate = set(old.get("unresolved") or []) | set(new.get("unresolved") or [])
+
     old_dangling = set(old.get("dangling") or [])
     new_dangling = set(new.get("dangling") or [])
-    newly_dangling = sorted(new_dangling - old_dangling)
+    newly_dangling = sorted(new_dangling - old_dangling - indeterminate)
     if newly_dangling:
         findings.append(
             _drift(
@@ -557,6 +609,12 @@ def _tls_drift(domain: str, old: dict[str, Any], new: dict[str, Any]) -> list[Fi
 
 @rule("ct")
 def _ct_drift(domain: str, old: dict[str, Any], new: dict[str, Any]) -> list[Finding]:
+    if old.get("names_truncated") or new.get("names_truncated"):
+        # The name list is a capped window, so a name can appear simply because
+        # another certificate expired out of it. Reporting that as a new
+        # hostname would be a false positive on every large domain.
+        return []
+
     old_names = set(old.get("covered_names") or [])
     new_names = set(new.get("covered_names") or [])
     if not old_names:

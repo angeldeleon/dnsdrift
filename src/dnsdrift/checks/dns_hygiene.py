@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ..models import CheckResult, Finding, FindingKind, Severity
-from ..resolver import DNSError
+from ..resolver import DNSError, NameStatus
 from .base import CheckContext, register
 
 RFC_CAA = "https://www.rfc-editor.org/rfc/rfc8659"
@@ -90,6 +90,10 @@ def check_dnssec(ctx: CheckContext) -> CheckResult:
     told to expect signed answers. The AD flag is recorded too, but on its own
     it only tells you the *resolver* validated — a non-validating resolver
     never sets it even for a properly signed zone.
+
+    Caveat: a configured name that is not a zone cut (``mail.example.com``
+    rather than ``example.com``) has no DS of its own and will always report as
+    unsigned. Configure apex domains.
     """
     domain = ctx.name
     try:
@@ -160,14 +164,21 @@ def check_caa(ctx: CheckContext) -> CheckResult:
     except DNSError as exc:
         return _error("caa", domain, str(exc))
 
+    if answer.truncated:
+        # A partial RRset would look like "CAs were removed" next run.
+        return _error("caa", domain, "CAA answer was truncated; refusing to record a partial record set")
+
     records = tuple(sorted(answer.records))
-    issuers = sorted({_caa_value(r) for r in records if " issue" in f" {r}"} - {""})
-    has_iodef = any("iodef" in r.lower() for r in records)
+    issuers = sorted({v for v in (_caa_issuer(r) for r in records) if v})
+    # RFC 8659 §4.2: `0 issue ";"` explicitly forbids all issuance.
+    issuance_forbidden = any(_caa_is_issue(r) and _caa_issuer(r) == "" for r in records)
+    has_iodef = any(_caa_property(r) == "iodef" for r in records)
 
     observations: dict[str, object] = {
         "records": list(records),
         "issuers": issuers,
         "iodef": has_iodef,
+        "issuance_forbidden": issuance_forbidden,
     }
     findings: list[Finding] = []
 
@@ -205,11 +216,43 @@ def check_caa(ctx: CheckContext) -> CheckResult:
     return CheckResult(check="caa", domain=domain, observations=observations, findings=findings)
 
 
-def _caa_value(record: str) -> str:
+def _caa_parts(record: str) -> tuple[str, str, str] | None:
+    """Split a CAA record into (flags, property tag, value)."""
     parts = record.split(None, 2)
     if len(parts) < 3:
-        return ""
-    return parts[2].strip().strip('"').strip().lower()
+        return None
+    return parts[0], parts[1].strip().lower(), parts[2].strip()
+
+
+def _caa_property(record: str) -> str:
+    parts = _caa_parts(record)
+    return parts[1] if parts else ""
+
+
+def _caa_is_issue(record: str) -> bool:
+    """True only for the ``issue`` property.
+
+    An exact comparison matters: a substring test also matches ``issuewild``,
+    which would report a wildcard-only CA as if it were authorised for all
+    issuance.
+    """
+    return _caa_property(record) == "issue"
+
+
+def _caa_issuer(record: str) -> str | None:
+    """Extract the issuer domain from an ``issue`` record.
+
+    RFC 8659 §4.2 defines the value as ``issuer-domain-name [";" *parameter]``,
+    so parameters must be stripped — otherwise adding ``; validationmethods=dns-01``
+    to an existing record reads as a brand-new CA being authorised.
+    """
+    if not _caa_is_issue(record):
+        return None
+    parts = _caa_parts(record)
+    if parts is None:
+        return None
+    value = parts[2].strip().strip('"').strip()
+    return value.split(";", 1)[0].strip().lower()
 
 
 @register("cname")
@@ -221,6 +264,11 @@ def check_cname(ctx: CheckContext) -> CheckResult:
     a valid certificate, from your origin. This is one of the highest-impact
     and least-noticed external exposures.
 
+    Only **NXDOMAIN** targets are treated as dangling. A target that exists but
+    holds no address records is not claimable, and a target we simply could not
+    resolve is recorded as unknown — a transient SERVFAIL at a CDN must never
+    surface as a CRITICAL takeover alert.
+
     The probe list is intentionally small. Full subdomain enumeration belongs
     in a dedicated tool; the point here is to catch the common cases cheaply on
     every scheduled run.
@@ -229,6 +277,7 @@ def check_cname(ctx: CheckContext) -> CheckResult:
     findings: list[Finding] = []
     cnames: dict[str, str] = {}
     dangling: list[str] = []
+    unresolved: list[str] = []
 
     candidates = [domain] + [f"{label}.{domain}" for label in _TAKEOVER_PROBE_LABELS]
 
@@ -236,6 +285,7 @@ def check_cname(ctx: CheckContext) -> CheckResult:
         try:
             answer = ctx.resolver.query(candidate, "CNAME")
         except DNSError:
+            unresolved.append(candidate)
             continue
         if not answer.exists or not answer.records:
             continue
@@ -244,11 +294,13 @@ def check_cname(ctx: CheckContext) -> CheckResult:
         cnames[candidate] = target
 
         try:
-            resolvable = ctx.resolver.exists(target)
+            status = ctx.resolver.name_status(target)
         except DNSError:
+            # Could not determine. Record it and move on without a finding.
+            unresolved.append(candidate)
             continue
 
-        if resolvable:
+        if status is not NameStatus.NXDOMAIN:
             continue
 
         dangling.append(candidate)
@@ -261,13 +313,13 @@ def check_cname(ctx: CheckContext) -> CheckResult:
                 severity=Severity.CRITICAL if prone else Severity.HIGH,
                 title=f"Dangling CNAME on {candidate}",
                 detail=(
-                    f"{candidate} is a CNAME to {target}, which does not resolve. "
+                    f"{candidate} is a CNAME to {target}, which does not exist (NXDOMAIN). "
                     + (
                         f"{target} is hosted on {prone}, where the underlying name can typically "
                         "be claimed by any account holder — an attacker who registers it serves "
                         f"content on {candidate} under your domain."
                         if prone
-                        else "An attacker who gains control of the target name can serve content "
+                        else "An attacker who registers the target name can serve content "
                         f"on {candidate} under your domain."
                     )
                 ),
@@ -283,5 +335,31 @@ def check_cname(ctx: CheckContext) -> CheckResult:
         "probed": candidates,
         "cnames": dict(sorted(cnames.items())),
         "dangling": sorted(dangling),
+        "unresolved": sorted(unresolved),
     }
-    return CheckResult(check="cname", domain=domain, observations=observations, findings=findings)
+
+    result = CheckResult(check="cname", domain=domain, observations=observations, findings=findings)
+
+    if unresolved:
+        # The observation is still recorded — discarding it would mean the
+        # baseline is never established on a domain with even one flaky probe,
+        # and the takeover drift rule would never fire at all. The indeterminate
+        # names are listed instead, and `_cname_drift` excludes exactly those
+        # from its comparisons.
+        result.findings.append(
+            Finding(
+                domain=domain,
+                check="cname",
+                kind=FindingKind.OPERATIONAL,
+                severity=Severity.LOW,
+                title="Some CNAME probes could not complete",
+                detail=(
+                    f"{len(unresolved)} name(s) could not be resolved: "
+                    f"{', '.join(sorted(unresolved)[:5])}. They are excluded from change detection "
+                    "this run rather than assumed absent."
+                ),
+                remediation="Re-run the scan. If it persists, check resolver reachability.",
+            )
+        )
+
+    return result

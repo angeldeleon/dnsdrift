@@ -34,6 +34,7 @@ __all__ = [
     "normalize_selector",
     "assert_public_http_url",
     "resolve_public_ips",
+    "_is_public_address",
 ]
 
 
