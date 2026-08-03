@@ -1,0 +1,64 @@
+# dnsdrift configuration
+#
+# Copy to domains.yml and edit. Validate with:
+#     dnsdrift validate -c domains.yml
+#
+# Unknown keys are a hard error, so a typo fails loudly instead of silently
+# disabling a check.
+
+domains:
+  # Shorthand: run every check with the default DKIM selector list.
+  - example.com
+
+  # Full form.
+  - name: example.org
+    # Your real DKIM selectors. Selectors cannot be enumerated from DNS, so
+    # listing yours here is what makes the DKIM check meaningful — and what
+    # lets dnsdrift alert you when one disappears.
+    dkim_selectors: [google, selector1, selector2]
+    # Per-domain check selection; omit to use the global default below.
+    checks: [spf, dmarc, dkim, mx, dnssec, caa, cname, tls, ct]
+    notes: "Primary sending domain"
+
+  # A parked domain: no mail, no website. Only worth watching for takeover
+  # and certificate surprises.
+  - name: example.net
+    checks: [cname, ct, caa]
+    notes: "Defensive registration — should never send mail"
+
+  # TLS served from a different hostname than the apex.
+  - name: example.co
+    tls_host: www.example.co
+
+# Default checks for domains that do not specify their own.
+checks: [spf, dmarc, dkim, mx, dnssec, caa, cname, tls, ct]
+
+settings:
+  timeout_seconds: 5
+  max_workers: 8
+  dns_retries: 2
+  # Omit to use the system resolvers. Set these to a resolver you trust —
+  # dnsdrift trusts whatever answers it gets.
+  # resolvers: [1.1.1.1, 8.8.8.8]
+  cert_expiry_warn_days: 30
+  cert_expiry_critical_days: 7
+  ct_lookback_days: 7
+  # Minimum severity that makes the process exit 1.
+  fail_on: high
+
+notify:
+  # These are the NAMES of environment variables, never the URLs themselves.
+  # Putting a URL here is rejected, so a secret cannot be committed by accident.
+  slack_webhook_url_env: SLACK_WEBHOOK_URL
+  # webhook_url_env: DNSDRIFT_WEBHOOK_URL
+  min_severity: medium
+
+ai:
+  # Off by default. When enabled, adds a plain-English summary paragraph to the
+  # report. The model cannot influence findings, severities, or the exit code.
+  # Enabling this sends your domain names and posture to a third-party API.
+  enabled: false
+  provider: anthropic
+  model: claude-sonnet-4-5
+  api_key_env: ANTHROPIC_API_KEY
+  max_findings: 40

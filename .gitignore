@@ -1,0 +1,33 @@
+# dnsdrift state — the example workflow commits this deliberately, but a local
+# run should not leak your domain inventory into a random commit.
+.dnsdrift/
+state.json
+domains.yml
+report.md
+findings.sarif
+findings.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

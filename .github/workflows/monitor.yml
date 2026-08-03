@@ -1,0 +1,100 @@
+# Scheduled monitoring — the intended way to run dnsdrift.
+#
+# Fork this repo (or copy this file), add your own domains.yml, set a
+# SLACK_WEBHOOK_URL secret, and you have daily posture monitoring with alerts
+# and findings in the Security tab. No servers, no database.
+#
+# The state file is committed back to the repo after each run. That is what
+# makes drift detection work across runs — and it turns your git history into
+# an audit log of every change to your domains' posture.
+#
+# NOTE: the state file contains an inventory of your domains, mail routing and
+# certificate metadata. Not secret, but a useful map for an attacker. Use a
+# private repository.
+
+name: Monitor domains
+
+on:
+  schedule:
+    - cron: "0 13 * * *" # daily at 13:00 UTC
+  workflow_dispatch: # allow a manual run from the Actions tab
+
+permissions:
+  contents: read
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to commit the updated baseline
+      security-events: write # to upload SARIF to code scanning
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dnsdrift
+        run: pip install dnsdrift
+
+      - name: Scan
+        id: scan
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          # Optional. Leave unset to keep the AI summary off.
+          # ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -uo pipefail
+          dnsdrift scan \
+            -c domains.yml \
+            --state .dnsdrift/state.json \
+            -o report.md \
+            -v
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+          # A second render from the same run for code scanning. --no-save
+          # keeps it from touching the baseline the first invocation just wrote.
+          dnsdrift scan \
+            -c domains.yml \
+            --state .dnsdrift/state.json \
+            -f sarif \
+            -o findings.sarif \
+            --no-save --no-notify || true
+
+      - name: Publish the report to the job summary
+        if: always()
+        run: cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload findings to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: findings.sarif
+          category: dnsdrift
+
+      - name: Commit the updated baseline
+        if: always()
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .dnsdrift/state.json
+          if git diff --staged --quiet; then
+            echo "No posture changes; baseline unchanged."
+          else
+            git commit -m "chore: update dnsdrift baseline [skip ci]"
+            git push
+          fi
+
+      - name: Fail the run if findings met the threshold
+        if: steps.scan.outputs.exit_code == '1'
+        run: |
+          echo "::error::dnsdrift found issues at or above the configured severity. See the job summary."
+          exit 1
+
+      - name: Fail loudly if the scan could not run
+        if: steps.scan.outputs.exit_code == '2'
+        run: |
+          echo "::error::dnsdrift could not complete the scan. A monitor that silently stops running is worse than one that fails."
+          exit 1
