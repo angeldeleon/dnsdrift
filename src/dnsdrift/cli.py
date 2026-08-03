@@ -217,6 +217,17 @@ def _write_report(report: ScanReport, output: str, fmt: str) -> None:
 
 
 def _exit_code(report: ScanReport, fail_on: Severity) -> int:
+    if report.scan_degraded:
+        # More than half the checks failed. Reporting "no findings" here would
+        # be a lie, and exiting 0 would turn a resolver outage into a green
+        # pipeline — the exact failure this module's docstring warns about.
+        log.error(
+            "scan is degraded: %d of %d checks failed; refusing to report a clean result",
+            report.checks_failed,
+            report.checks_run,
+        )
+        return EXIT_ERROR
+
     highest = report.max_severity
     if highest is not None and highest >= fail_on:
         log.info("highest severity %s meets the %s threshold", highest.value, fail_on.value)
@@ -236,6 +247,11 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_ERROR
     except ValidationError as exc:
         log.error("%s", exc)
+        return EXIT_ERROR
+    except Exception:  # noqa: BLE001 - exit 1 means "findings", never "crashed"
+        # Python exits 1 on an unhandled exception, which is indistinguishable
+        # from EXIT_FINDINGS. Anything unexpected must surface as EXIT_ERROR.
+        log.exception("unexpected error; the scan did not complete")
         return EXIT_ERROR
 
 

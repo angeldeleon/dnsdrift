@@ -10,11 +10,11 @@ from __future__ import annotations
 import pytest
 
 from dnsdrift.checks.base import CheckContext
-from dnsdrift.checks.dns_hygiene import check_caa, check_dnssec
+from dnsdrift.checks.dns_hygiene import check_caa, check_cname, check_dnssec
 from dnsdrift.checks.email_auth import check_dkim, check_dmarc, check_mx, check_spf
 from dnsdrift.config import DomainConfig, Settings
 from dnsdrift.models import FindingKind, Severity
-from dnsdrift.resolver import DNSAnswer, DNSError
+from dnsdrift.resolver import DNSAnswer, DNSError, NameStatus
 
 
 class FakeResolver:
@@ -37,8 +37,11 @@ class FakeResolver:
     def txt(self, name: str) -> DNSAnswer:
         return self._lookup(name, "TXT")
 
-    def exists(self, name: str) -> bool:
-        return bool(self.answers.get((name, "EXISTS"), False))
+    def name_status(self, name: str) -> NameStatus:
+        value = self.answers.get((name, "STATUS"), NameStatus.NXDOMAIN)
+        if isinstance(value, Exception):
+            raise value
+        return value  # type: ignore[return-value]
 
 
 def ctx(answers: dict, domain: str = "example.com", **kwargs) -> CheckContext:
@@ -222,3 +225,136 @@ class TestHostnameMatching:
         from dnsdrift.checks.tls import _hostname_matches
 
         assert _hostname_matches(host, None, names) is expected
+
+
+class TestCNAMETakeover:
+    """The dangling-CNAME check is the loudest thing this tool emits.
+
+    A CRITICAL "your subdomain is claimable" alert that fires on a transient
+    SERVFAIL at someone else's CDN would destroy trust in the whole tool, so
+    each of these states gets an explicit test.
+    """
+
+    def _ctx(self, target: str, status):
+        answers = {("www.example.com", "CNAME"): [target], (target, "STATUS"): status}
+        return ctx(answers)
+
+    def test_nxdomain_target_on_prone_provider_is_critical(self) -> None:
+        result = check_cname(self._ctx("tenant.herokuapp.com", NameStatus.NXDOMAIN))
+        assert any(f.severity is Severity.CRITICAL for f in result.findings)
+        assert result.observations["dangling"] == ["www.example.com"]
+        assert result.error is None
+
+    def test_nxdomain_target_elsewhere_is_high(self) -> None:
+        result = check_cname(self._ctx("gone.example.net", NameStatus.NXDOMAIN))
+        assert [f.severity for f in result.findings] == [Severity.HIGH]
+
+    def test_resolving_target_is_clean(self) -> None:
+        result = check_cname(self._ctx("live.herokuapp.com", NameStatus.RESOLVES))
+        assert result.findings == []
+        assert result.observations["dangling"] == []
+
+    def test_nodata_target_is_not_dangling(self) -> None:
+        """A name with only MX/TXT records exists and cannot be claimed."""
+        result = check_cname(self._ctx("mailonly.example.net", NameStatus.NODATA))
+        assert result.observations["dangling"] == []
+        assert not any(f.kind is FindingKind.POSTURE for f in result.findings)
+
+    def test_lookup_failure_never_reports_takeover(self) -> None:
+        """The regression that matters: a SERVFAIL is not an NXDOMAIN."""
+        result = check_cname(self._ctx("cdn.example.net", DNSError("timed out")))
+        assert result.observations["dangling"] == []
+        assert not any(f.severity >= Severity.HIGH for f in result.findings)
+        assert result.findings[0].kind is FindingKind.OPERATIONAL
+        # The name is named as indeterminate so the drift engine can exclude it...
+        assert result.observations["unresolved"] == ["www.example.com"]
+        # ...but the observation is still recorded. Discarding it would mean a
+        # domain with one flaky probe never builds a baseline, which would
+        # silently disable takeover drift detection entirely.
+        assert result.error is None
+
+
+class TestCAAParsing:
+    def test_issuewild_is_not_treated_as_issue(self) -> None:
+        answers = {("example.com", "CAA"): ['0 issuewild "digicert.com"']}
+        result = check_caa(ctx(answers))
+        assert result.observations["issuers"] == []
+
+    def test_parameters_are_stripped_from_the_issuer(self) -> None:
+        answers = {("example.com", "CAA"): ['0 issue "letsencrypt.org; validationmethods=dns-01"']}
+        result = check_caa(ctx(answers))
+        assert result.observations["issuers"] == ["letsencrypt.org"]
+
+    def test_semicolon_means_issuance_forbidden_not_a_ca_named_semicolon(self) -> None:
+        result = check_caa(ctx({("example.com", "CAA"): ['0 issue ";"']}))
+        assert result.observations["issuers"] == []
+        assert result.observations["issuance_forbidden"] is True
+
+
+class TestTruncationSafety:
+    """A truncated RRset must never be persisted as if it were complete."""
+
+    def test_truncated_txt_does_not_report_missing_spf(self) -> None:
+        class TruncatingResolver(FakeResolver):
+            def txt(self, name: str) -> DNSAnswer:
+                return DNSAnswer(name=name, rdtype="TXT", records=("v=spf1 -all",), truncated=True)
+
+        context = CheckContext(
+            domain=DomainConfig(name="example.com"),
+            settings=Settings(),
+            resolver=TruncatingResolver(),  # type: ignore[arg-type]
+        )
+        result = check_spf(context)
+        assert result.error is not None
+        assert "No SPF record" not in titles(result)
+        assert result.findings[0].kind is FindingKind.OPERATIONAL
+
+
+class TestSPFEdgeCases:
+    def test_redirect_is_a_valid_terminator(self) -> None:
+        """v=spf1 redirect=... is common and must not be flagged."""
+        result = check_spf(ctx({("example.com", "TXT"): ["v=spf1 redirect=_spf.example.net"]}))
+        assert "SPF record has no 'all' mechanism" not in titles(result)
+        assert result.observations["redirect"] is True
+
+    def test_qualified_ptr_is_still_flagged(self) -> None:
+        result = check_spf(ctx({("example.com", "TXT"): ["v=spf1 +ptr -all"]}))
+        assert any("deprecated ptr" in t for t in titles(result))
+
+
+class TestDMARCEdgeCases:
+    def test_version_prefix_is_not_accepted(self) -> None:
+        result = check_dmarc(ctx({("_dmarc.example.com", "TXT"): ["v=DMARC12345; p=reject"]}))
+        assert result.observations["record_count"] == 0
+
+    def test_out_of_range_pct_is_flagged_and_normalised(self) -> None:
+        answers = {("_dmarc.example.com", "TXT"): ["v=DMARC1; p=reject; pct=150; rua=mailto:a@b.com"]}
+        result = check_dmarc(ctx(answers))
+        assert any("out of range" in t for t in titles(result))
+        assert result.observations["pct"] == 100
+
+    def test_invalid_record_is_not_worse_than_no_record(self) -> None:
+        no_record = check_dmarc(ctx({}))
+        no_policy = check_dmarc(ctx({("_dmarc.example.com", "TXT"): ["v=DMARC1; rua=mailto:a@b.com"]}))
+        assert max(f.severity for f in no_policy.findings) <= max(f.severity for f in no_record.findings)
+
+
+class TestDKIMReliability:
+    def test_failed_lookups_are_named_not_assumed_absent(self) -> None:
+        """One timeout among many selectors must not read as 'selector removed'."""
+        answers = {
+            ("google._domainkey.example.com", "TXT"): ["v=DKIM1; k=rsa; p=" + "A" * 400],
+            ("selector1._domainkey.example.com", "TXT"): DNSError("timed out"),
+        }
+        result = check_dkim(ctx(answers, dkim_selectors=("google", "selector1")))
+        assert result.observations["selectors_errored"] == ["selector1"]
+        assert result.observations["selectors_found"] == ["google"]
+        assert any(f.kind is FindingKind.OPERATIONAL for f in result.findings)
+        # Recorded, not discarded: a domain with one persistently flaky selector
+        # must still build a baseline for the other fifteen.
+        assert result.error is None
+
+    def test_key_type_tag_is_case_insensitive(self) -> None:
+        answers = {("default._domainkey.example.com", "TXT"): ["v=DKIM1; k=RSA; p=" + "A" * 100]}
+        result = check_dkim(ctx(answers, dkim_selectors=("default",)))
+        assert any("weak RSA key" in t for t in titles(result))

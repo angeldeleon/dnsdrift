@@ -8,6 +8,7 @@ config is how a check ends up quietly disabled.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,7 +17,9 @@ from typing import Any
 import yaml
 
 from .models import Severity
-from .validation import ValidationError, normalize_domain, normalize_selector
+from .validation import ValidationError, _is_public_address, normalize_domain, normalize_selector
+
+log = logging.getLogger(__name__)
 
 # Selectors used by the large mail providers. Absence of a hit here is not
 # evidence of absence — DKIM offers no way to enumerate selectors — so the DKIM
@@ -75,6 +78,7 @@ class Settings:
     max_workers: int = 8
     dns_retries: int = 2
     resolvers: tuple[str, ...] = ()  # empty = system resolvers
+    allow_internal_resolvers: bool = False
     cert_expiry_warn_days: int = 30
     cert_expiry_critical_days: int = 7
     ct_lookback_days: int = 7
@@ -218,6 +222,7 @@ def _parse_settings(raw: Any) -> Settings:
         "max_workers",
         "dns_retries",
         "resolvers",
+        "allow_internal_resolvers",
         "cert_expiry_warn_days",
         "cert_expiry_critical_days",
         "ct_lookback_days",
@@ -256,6 +261,11 @@ def _parse_settings(raw: Any) -> Settings:
             raise ValidationError("settings.user_agent must be a single line under 200 characters")
         settings.user_agent = ua
 
+    if "allow_internal_resolvers" in mapping:
+        if not isinstance(mapping["allow_internal_resolvers"], bool):
+            raise ValidationError("settings.allow_internal_resolvers must be true or false")
+        settings.allow_internal_resolvers = mapping["allow_internal_resolvers"]
+
     if "resolvers" in mapping:
         resolvers_raw = mapping["resolvers"]
         if not isinstance(resolvers_raw, list):
@@ -265,10 +275,25 @@ def _parse_settings(raw: Any) -> Settings:
         resolvers: list[str] = []
         for item in resolvers_raw:
             try:
-                resolvers.append(str(ipaddress.ip_address(str(item).strip())))
+                parsed = ipaddress.ip_address(str(item).strip())
             except ValueError as exc:
                 raise ValidationError(f"settings.resolvers entry {item!r} is not an IP address") from exc
+            # A config that points the resolver at 169.254.169.254 or 10.0.0.53
+            # turns the tool into a read primitive for internal DNS from inside
+            # CI, bypassing the SSRF guard that protects every other outbound
+            # path. Pointing at an internal resolver is a legitimate enterprise
+            # use case, so it is allowed — but only deliberately.
+            if not _is_public_address(parsed) and not settings.allow_internal_resolvers:
+                raise ValidationError(
+                    f"settings.resolvers entry {item!r} is not a public address. "
+                    "Set settings.allow_internal_resolvers: true to permit an internal resolver."
+                )
+            resolvers.append(str(parsed))
         settings.resolvers = tuple(resolvers)
+        if resolvers and settings.allow_internal_resolvers:
+            log.warning(
+                "allow_internal_resolvers is enabled; queries and their answers may traverse internal DNS"
+            )
 
     if settings.cert_expiry_critical_days > settings.cert_expiry_warn_days:
         raise ValidationError(

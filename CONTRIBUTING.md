@@ -41,7 +41,13 @@ Three things the codebase is strict about, and a review will catch:
 
 **Observations must be deterministic.** Whatever a check puts in `observations` gets persisted and diffed against the next run. Sort anything unordered, and leave out anything that changes on its own — timestamps, per-renewal certificate serials, response ordering. A field that varies run-to-run produces a drift finding on every single scan, and a tool that cries wolf every morning gets muted inside a week.
 
-**A failed lookup is not a missing record.** If the resolver times out, return a `CheckResult` with `error` set and an `OPERATIONAL` finding. Never report "no DMARC record" when what actually happened is "could not reach a nameserver". This is the single fastest way to destroy trust in a monitoring tool, and there is a regression test for it.
+**A failed lookup is not a missing record.** Three states, never two: the record exists, it definitively does not, or you could not find out. Collapsing the third into the second is what makes a monitoring tool produce confident false alarms — a SERVFAIL at a CDN becoming a CRITICAL "subdomain takeover", say. There are regression tests for exactly this.
+
+How to express each case:
+
+- **Whole check failed** (single lookup, no usable data): set `CheckResult.error` and emit an `OPERATIONAL` finding. Observations are discarded and the previous baseline is left alone.
+- **Some of many speculative lookups failed** (DKIM probes 16 selectors, CNAME probes 15 names): record the observations *and* a list naming what was indeterminate — `selectors_errored`, `unresolved`. The drift rule excludes exactly those from its comparison. Do not fail the whole check: a domain with one persistently flaky probe would then never build a baseline, silently disabling that check's drift detection forever.
+- **True but incomplete** (TLS knows the host is down but nothing about its certificate): set `partial=True`. The scanner merges the observation over the previous baseline instead of replacing it, so fields you could not determine survive.
 
 **Severity should mean something.** `CRITICAL` is for exploitable-right-now (`+all`, a dangling CNAME on a claimable provider, an expired certificate). `HIGH` is for a serious gap or a real downgrade. Reserve `INFO` for things that are worth recording but never worth waking anyone up. If everything is high, nothing is.
 

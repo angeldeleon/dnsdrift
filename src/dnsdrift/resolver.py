@@ -3,12 +3,19 @@
 Checks never touch dnspython directly. Routing every lookup through here means
 timeouts, retry limits, answer-size caps and result normalisation are applied
 uniformly, and a check author cannot accidentally issue an unbounded query.
+
+The single most important property here is that **a lookup failure is never
+silently converted into "no record"**. Every method distinguishes three states —
+the record exists, it definitively does not, or we could not find out — because
+collapsing the third into the second is what makes a monitoring tool produce
+confident false alarms.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from enum import Enum
 
 import dns.exception
 import dns.flags
@@ -22,7 +29,7 @@ from .validation import normalize_domain
 log = logging.getLogger(__name__)
 
 # A domain answering with thousands of TXT records is either broken or trying
-# to blow up the consumer. Truncate and move on.
+# to blow up the consumer. Cap it, and tell the caller we did.
 _MAX_RECORDS_PER_RRSET = 100
 _MAX_RECORD_LENGTH = 4096
 
@@ -33,6 +40,20 @@ class DNSError(Exception):
 
 class DomainNotFound(DNSError):
     """NXDOMAIN — the name does not exist."""
+
+
+class NameStatus(str, Enum):
+    """Whether a name resolves.
+
+    ``NXDOMAIN`` and ``NODATA`` are deliberately distinct. For subdomain-takeover
+    detection only NXDOMAIN matters: the target name is unregistered and can be
+    claimed. A NODATA name exists (it may hold only MX or TXT records) and is not
+    claimable, so reporting it as dangling would be a false positive.
+    """
+
+    RESOLVES = "resolves"
+    NXDOMAIN = "nxdomain"
+    NODATA = "nodata"
 
 
 @dataclass(slots=True)
@@ -116,23 +137,27 @@ class Resolver:
         if answer.rrset is None:
             return DNSAnswer(name=qname, rdtype=rdtype, records=(), exists=True, authenticated=authenticated)
 
-        records: list[str] = []
-        truncated = False
-        for rdata in answer.rrset:
-            if len(records) >= _MAX_RECORDS_PER_RRSET:
-                truncated = True
-                log.warning(
-                    "truncating %s answer for %s at %d records", rdtype, qname, _MAX_RECORDS_PER_RRSET
-                )
-                break
-            records.append(_render(rdata)[:_MAX_RECORD_LENGTH])
+        records = [_render(rdata)[:_MAX_RECORD_LENGTH] for rdata in answer.rrset]
 
-        # Sort for determinism: many resolvers rotate RRset order, and unsorted
-        # output would show up as spurious drift on every single run.
+        # Sort BEFORE truncating. Many resolvers rotate RRset order between
+        # responses, so slicing the wire order first would select a different
+        # subset each run and manufacture drift on every single scan.
+        records.sort()
+        truncated = len(records) > _MAX_RECORDS_PER_RRSET
+        if truncated:
+            log.warning(
+                "truncating %s answer for %s: %d records exceeds the %d cap",
+                rdtype,
+                qname,
+                len(records),
+                _MAX_RECORDS_PER_RRSET,
+            )
+            records = records[:_MAX_RECORDS_PER_RRSET]
+
         return DNSAnswer(
             name=qname,
             rdtype=rdtype,
-            records=tuple(sorted(records)),
+            records=tuple(records),
             exists=True,
             truncated=truncated,
             authenticated=authenticated,
@@ -143,43 +168,89 @@ class Resolver:
 
         A TXT record longer than 255 bytes is transmitted as several character
         strings that must be joined *without* a separator (RFC 7208 §3.3). Long
-        SPF and DKIM records rely on this; naive parsers that join with a space
-        corrupt them.
+        SPF and DKIM records rely on this.
+
+        The join is done from dnspython's decoded ``strings`` rather than by
+        re-parsing ``to_text()``. Re-parsing quoted output loses whitespace-only
+        segments and mangles records containing escaped quotes, either of which
+        silently corrupts the record and shows up later as phantom drift.
         """
-        answer = self.query(name, "TXT")
-        joined = tuple(sorted(_join_txt(record) for record in answer.records))
+        qname = name
+
+        try:
+            answer = self._resolver.resolve(qname, "TXT", raise_on_no_answer=False, search=False)
+        except dns.resolver.NXDOMAIN:
+            return DNSAnswer(name=qname, rdtype="TXT", records=(), exists=False)
+        except dns.resolver.NoNameservers as exc:
+            raise DNSError(f"no nameserver could answer TXT for {qname}: {exc}") from exc
+        except dns.resolver.LifetimeTimeout as exc:
+            raise DNSError(f"timed out resolving TXT for {qname}") from exc
+        except dns.exception.DNSException as exc:
+            raise DNSError(f"DNS error resolving TXT for {qname}: {exc}") from exc
+
+        authenticated = False
+        response = getattr(answer, "response", None)
+        if response is not None:
+            authenticated = bool(response.flags & dns.flags.AD)
+
+        if answer.rrset is None:
+            return DNSAnswer(name=qname, rdtype="TXT", records=(), exists=True, authenticated=authenticated)
+
+        records: list[str] = []
+        for rdata in answer.rrset:
+            strings = getattr(rdata, "strings", None)
+            if strings is None:  # pragma: no cover - defensive
+                records.append(_render(rdata)[:_MAX_RECORD_LENGTH])
+                continue
+            joined = b"".join(strings)
+            records.append(joined.decode("utf-8", errors="replace")[:_MAX_RECORD_LENGTH])
+
+        records.sort()
+        truncated = len(records) > _MAX_RECORDS_PER_RRSET
+        if truncated:
+            log.warning("truncating TXT answer for %s at %d records", qname, _MAX_RECORDS_PER_RRSET)
+            records = records[:_MAX_RECORDS_PER_RRSET]
+
         return DNSAnswer(
-            name=answer.name,
+            name=qname,
             rdtype="TXT",
-            records=joined,
-            exists=answer.exists,
-            truncated=answer.truncated,
-            authenticated=answer.authenticated,
+            records=tuple(records),
+            exists=True,
+            truncated=truncated,
+            authenticated=authenticated,
         )
 
-    def exists(self, name: str) -> bool:
-        """True if *name* resolves to anything at all."""
+    def name_status(self, name: str) -> NameStatus:
+        """Determine whether *name* resolves, distinguishing NXDOMAIN from NODATA.
+
+        Raises :class:`DNSError` if every probe failed — the caller must not be
+        able to mistake "we could not reach a nameserver" for "the name does not
+        exist". That mistake is what turns a transient SERVFAIL on a CDN into a
+        confident CRITICAL "subdomain takeover" alert.
+        """
+        failures: list[str] = []
+        saw_nodata = False
+
         for rdtype in ("A", "AAAA", "CNAME"):
             try:
                 answer = self.query(name, rdtype)
-            except DNSError:
+            except DNSError as exc:
+                failures.append(str(exc))
                 continue
             if not answer.exists:
-                return False
+                return NameStatus.NXDOMAIN
             if answer.records:
-                return True
-        return False
+                return NameStatus.RESOLVES
+            saw_nodata = True
+
+        if saw_nodata:
+            return NameStatus.NODATA
+
+        raise DNSError(
+            f"could not determine whether {name} resolves; all lookups failed ({'; '.join(failures[:3])})"
+        )
 
 
 def _render(rdata: object) -> str:
     text = rdata.to_text()  # type: ignore[attr-defined]
     return text.strip()
-
-
-def _join_txt(record: str) -> str:
-    """Reassemble a quoted, possibly multi-part TXT record into its value."""
-    text = record.strip()
-    if '" "' in text or text.startswith('"'):
-        parts = [segment for segment in text.split('"') if segment.strip() != ""]
-        return "".join(parts)
-    return text

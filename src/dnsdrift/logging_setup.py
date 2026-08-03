@@ -30,6 +30,9 @@ _REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?i)(api[_-]?key|token|secret|password)([\"'\s:=]+)([^\s\"',}]{8,})"), r"\1\2<redacted>"),
     # Any URL carrying a query string or userinfo may hold a credential.
     (re.compile(r"(https?://[^\s/]+)/\S*\?\S+"), r"\1/<redacted>"),
+    # Most webhook providers put the secret in the URL *path*, not a query
+    # string, so a long opaque path segment is treated as credential-shaped.
+    (re.compile(r"(https?://[^\s/]+)(?:/[^\s/]*)*?/[A-Za-z0-9_-]{16,}\S*"), r"\1/<redacted>"),
     (re.compile(r"(https?://)[^\s/@]+:[^\s/@]+@"), r"\1<redacted>@"),
 )
 
@@ -47,6 +50,20 @@ class RedactingFilter(logging.Filter):
         if redacted != message:
             record.msg = redacted
             record.args = ()
+
+        # Tracebacks are formatted separately by the Formatter and never pass
+        # through record.getMessage(), so they need redacting explicitly.
+        if record.exc_info:
+            try:
+                formatted = logging.Formatter().formatException(record.exc_info)
+            except Exception:  # pragma: no cover - never let logging raise
+                formatted = ""
+            if formatted:
+                record.exc_text = redact(formatted)
+                record.exc_info = None
+        elif record.exc_text:
+            record.exc_text = redact(record.exc_text)
+
         return True
 
 
