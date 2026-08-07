@@ -29,14 +29,14 @@ jobs:
       contents: write # to commit the updated baseline
       security-events: write # to upload SARIF to code scanning
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
 
       - name: Install dnsdrift
-        run: pip install dnsdrift
+        run: pip install .
 
       - name: Scan
         id: scan
@@ -68,7 +68,7 @@ jobs:
 
       - name: Upload findings to code scanning
         if: always()
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
         with:
           sarif_file: findings.sarif
           category: dnsdrift
@@ -79,7 +79,7 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .dnsdrift/state.json
+          git add -f .dnsdrift/state.json || { echo "No baseline written this run."; exit 0; }
           if git diff --staged --quiet; then
             echo "No posture changes; baseline unchanged."
           else
