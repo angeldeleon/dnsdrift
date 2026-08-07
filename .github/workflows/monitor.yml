@@ -15,8 +15,8 @@
 name: Monitor domains
 
 on:
-  schedule:
-    - cron: "0 13 * * *" # daily at 13:00 UTC
+  # schedule: re-enable after adding your own domains.yml (see header)
+  #   - cron: "0 13 * * *" # daily at 13:00 UTC
   workflow_dispatch: # allow a manual run from the Actions tab
 
 permissions:
