@@ -44,6 +44,14 @@ from .base import CheckContext, register
 # Signature algorithms that no longer provide collision resistance.
 _WEAK_SIGNATURE_HASHES = {"md5", "sha1"}
 
+# The lowest protocol version the inspection socket offers is TLS 1.0
+# (``MINIMUM_PROTOCOL`` below), so these are the only deprecated versions a
+# handshake can actually come back with. Listing SSLv3 here as well would be a
+# branch that can never run, which reads as coverage the check does not have.
+_DEPRECATED_PROTOCOLS = ("TLSv1", "TLSv1.1")
+
+MINIMUM_PROTOCOL = ssl.TLSVersion.TLSv1
+
 _MIN_RSA_BITS = 2048
 _MIN_EC_BITS = 256
 
@@ -303,7 +311,7 @@ def check_tls(ctx: CheckContext) -> CheckResult:
             )
         )
 
-    if negotiated_protocol in ("TLSv1", "TLSv1.1", "SSLv3"):
+    if negotiated_protocol in _DEPRECATED_PROTOCOLS:
         findings.append(
             Finding(
                 domain=domain,
@@ -346,7 +354,7 @@ def _fetch_peer_certificate(host: str, address: str, *, timeout: float) -> tuple
     context.verify_mode = ssl.CERT_NONE  # noqa: S501
     # Allow old protocols so that a server still speaking TLS 1.0 can be
     # detected and reported rather than appearing as an unreachable host.
-    context.minimum_version = ssl.TLSVersion.TLSv1
+    context.minimum_version = MINIMUM_PROTOCOL
     context.set_ciphers("DEFAULT:@SECLEVEL=1")
 
     with socket.create_connection((address, 443), timeout=timeout) as raw:

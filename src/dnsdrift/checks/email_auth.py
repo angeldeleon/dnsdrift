@@ -23,6 +23,16 @@ RFC_DKIM = "https://www.rfc-editor.org/rfc/rfc6376"
 # silently stops working.
 _SPF_LOOKUP_LIMIT = 10
 
+# RFC 7208 §4.5: the version must be exactly "v=spf1", terminated by a space or
+# the end of the record. A bare prefix match also accepts "v=spf10 ...", which
+# would count an unrelated TXT record as a second SPF record and report a
+# perfectly healthy domain as unprotected.
+_SPF_VERSION_RE = re.compile(r"^v=spf1(\s|$)", re.IGNORECASE)
+
+
+def _is_spf_record(record: str) -> bool:
+    return bool(_SPF_VERSION_RE.match(record))
+
 
 def _error(check: str, domain: str, message: str) -> CheckResult:
     """Represent an infrastructure failure as a finding, not a crash.
@@ -67,7 +77,7 @@ def check_spf(ctx: CheckContext) -> CheckResult:
         # would surface as "No SPF record" and then as "SPF record was removed".
         return _error("spf", domain, "TXT answer was truncated; refusing to record a partial record set")
 
-    records = [r for r in answer.records if r.lower().startswith("v=spf1")]
+    records = [r for r in answer.records if _is_spf_record(r)]
     observations: dict[str, object] = {
         "record_count": len(records),
         "record": records[0] if len(records) == 1 else None,

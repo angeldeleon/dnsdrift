@@ -13,6 +13,10 @@ from typing import Any
 
 from .models import FindingKind, ScanReport, Severity
 
+# Every rendering of a scan. Named once so the CLI's accepted values and the
+# renderer table cannot drift apart.
+FORMATS: tuple[str, ...] = ("markdown", "md", "json", "sarif")
+
 _SEVERITY_EMOJI = {
     Severity.CRITICAL: "🔴",
     Severity.HIGH: "🟠",
@@ -126,14 +130,49 @@ def _md(text: str) -> str:
 def _escape_md(line: str) -> str:
     """Escape the characters that actually carry meaning in rendered Markdown.
 
-    Only ``<`` can open an HTML tag, so that is always escaped. ``>`` is only
-    significant at the start of a line, where it begins a blockquote — escaping
-    it everywhere would render every "p=reject -> p=none" as "-&gt;".
+    Three of them:
+
+    * ``<`` can open an HTML tag, so it is always escaped.
+    * ``[`` and ``]`` build a link. A certificate issuer of
+      ``Example CA [renew now](https://attacker.example)`` would otherwise
+      render as a hyperlink inside a report that reads as though the scanner
+      put it there, which is exactly the credibility a phish wants to borrow.
+    * ``>`` is only significant at the start of a line, where it begins a
+      blockquote — escaping it everywhere would render every
+      "p=reject -> p=none" as "-&gt;".
     """
-    escaped = line.replace("<", "&lt;")
+    escaped = line.replace("<", "&lt;").replace("[", "\\[").replace("]", "\\]")
     if escaped.startswith(">"):
         escaped = "&gt;" + escaped[1:]
     return escaped
+
+
+# Characters that mean nothing mid-line but open a block when they start one:
+# headings, list bullets, block quotes, table rows, thematic breaks, setext
+# underlines and code fences.
+_LEADING_MARKUP_CHARS = frozenset("#>*+-=|`~_")
+
+# "1." and "1)" both start an ordered list. The escape has to land on the
+# punctuation, not the digit — a backslash before a digit is just a backslash.
+_ORDERED_LIST_RE = re.compile(r"^(\d{1,9})([.)])")
+
+
+def _escape_leading_markup(line: str) -> str:
+    """Stop a line from opening a Markdown block.
+
+    :func:`_escape_md` handles what is dangerous anywhere in a line. This
+    handles what is only dangerous first: a line beginning ``##`` becomes a
+    heading, and a heading is how a paragraph stops looking like a paragraph
+    and starts looking like a section of the report proper.
+    """
+    if not line:
+        return line
+    if line[0] in _LEADING_MARKUP_CHARS:
+        return "\\" + line
+    match = _ORDERED_LIST_RE.match(line)
+    if match:
+        return f"{match.group(1)}\\{match.group(2)}{line[match.end() :]}"
+    return line
 
 
 def _md_block(text: str) -> str:
@@ -142,6 +181,14 @@ def _md_block(text: str) -> str:
     Used for the AI summary, which is multi-line prose. Line structure is kept;
     every other control character is still removed, runs of blank lines are
     capped, and angle brackets are escaped.
+
+    Keeping the line breaks is what makes this different from :func:`_md`, and
+    it is also what makes it riskier: a summary is the one place in the report
+    where attacker-influenced input reaches a renderer that is still willing to
+    start a new block. The summariser is fed DNS records it does not control,
+    so a record that talks it into emitting ``## Changes since last scan (0)``
+    would otherwise forge a section header above the real findings. Every line
+    therefore has its leading markup escaped as well.
     """
     lines = [
         " ".join(_CONTROL_CHARS_RE.sub(" ", line).split())
@@ -152,7 +199,7 @@ def _md_block(text: str) -> str:
     for line in lines:
         if line:
             blanks = 0
-            out.append(_escape_md(line))
+            out.append(_escape_leading_markup(_escape_md(line)))
         else:
             blanks += 1
             if blanks <= 1:

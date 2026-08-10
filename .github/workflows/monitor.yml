@@ -1,8 +1,13 @@
 # Scheduled monitoring — the intended way to run dnsdrift.
 #
 # Fork this repo (or copy this file), add your own domains.yml, set a
-# SLACK_WEBHOOK_URL secret, and you have daily posture monitoring with alerts
-# and findings in the Security tab. No servers, no database.
+# SLACK_WEBHOOK_URL secret, then uncomment the schedule below and you have
+# daily posture monitoring with alerts and findings in the Security tab. No
+# servers, no database.
+#
+# The schedule ships commented out on purpose: this repository has no
+# domains.yml, so a cron here would only produce a daily red run for anyone who
+# forked it and had not finished setting it up yet.
 #
 # The state file is committed back to the repo after each run. That is what
 # makes drift detection work across runs — and it turns your git history into
@@ -45,29 +50,45 @@ jobs:
           # Optional. Leave unset to keep the AI summary off.
           # ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
+          # Actions runs this with `bash -e`. `set -uo pipefail` turns on -u and
+          # pipefail but does NOT clear the inherited -e, so without `set +e` an
+          # exit of 1 or 2 — the two outcomes the steps below exist to react to —
+          # kills this step before the code can be recorded, and every failure
+          # then looks identical.
+          set +e
           set -uo pipefail
+
+          # One scan, two renderings. Running dnsdrift a second time to produce
+          # the SARIF would diff against the baseline this run just saved, so
+          # the file uploaded to code scanning would contain no drift at all.
           dnsdrift scan \
             -c domains.yml \
             --state .dnsdrift/state.json \
             -o report.md \
+            --extra-output sarif:findings.sarif \
             -v
-          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          rc=$?
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
 
-          # A second render from the same run for code scanning. --no-save
-          # keeps it from touching the baseline the first invocation just wrote.
-          dnsdrift scan \
-            -c domains.yml \
-            --state .dnsdrift/state.json \
-            -f sarif \
-            -o findings.sarif \
-            --no-save --no-notify || true
+          # The step itself always succeeds; the dedicated steps below turn the
+          # recorded code into a job result, so that "found problems" and "could
+          # not check" stay distinguishable in the Actions UI.
+          exit 0
 
       - name: Publish the report to the job summary
         if: always()
-        run: cat report.md >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          set -uo pipefail
+          # A config error exits before anything is rendered, so do not turn a
+          # missing file into a second, more confusing failure.
+          if [ -f report.md ]; then
+            cat report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "dnsdrift wrote no report; see the Scan step." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload findings to code scanning
-        if: always()
+        if: always() && hashFiles('findings.sarif') != ''
         uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
         with:
           sarif_file: findings.sarif

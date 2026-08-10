@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -24,7 +25,7 @@ from .config import ALL_CHECKS, Config, DomainConfig, Settings, load_config
 from .logging_setup import configure_logging
 from .models import ScanReport, Severity
 from .notify import notify
-from .report import render
+from .report import FORMATS, render
 from .scanner import scan
 from .store import DEFAULT_STATE_PATH, SnapshotStore, StateError
 from .validation import ValidationError
@@ -63,8 +64,20 @@ def build_parser() -> argparse.ArgumentParser:
         "-f",
         "--format",
         default="markdown",
-        choices=("markdown", "md", "json", "sarif"),
+        choices=FORMATS,
         help="report format (default: markdown)",
+    )
+    scan_parser.add_argument(
+        "--extra-output",
+        action="append",
+        default=[],
+        metavar="FORMAT:PATH",
+        help=(
+            "write an additional rendering of the same scan, e.g. sarif:findings.sarif "
+            "(repeatable). Rendering twice from one scan is not a convenience: a second "
+            "`dnsdrift scan` would diff against the baseline the first one just saved and "
+            "so would contain no drift at all"
+        ),
     )
     scan_parser.add_argument(
         "--state",
@@ -92,9 +105,7 @@ def build_parser() -> argparse.ArgumentParser:
         "check", parents=[common], help="run a one-off scan of a single domain, without state"
     )
     check_parser.add_argument("domain", help="the domain to check")
-    check_parser.add_argument(
-        "-f", "--format", default="markdown", choices=("markdown", "md", "json", "sarif")
-    )
+    check_parser.add_argument("-f", "--format", default="markdown", choices=FORMATS)
     check_parser.add_argument(
         "--checks",
         default=",".join(ALL_CHECKS),
@@ -113,6 +124,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
+    try:
+        extra_outputs = _parse_extra_outputs(args.extra_output)
+    except ValidationError as exc:
+        log.error("%s", exc)
+        return EXIT_ERROR
+
     try:
         config = load_config(args.config)
     except ValidationError as exc:
@@ -135,6 +152,11 @@ def cmd_scan(args: argparse.Namespace) -> int:
         report.ai_summary = summarize(report, config.ai)
 
     _write_report(report, args.output, args.format)
+    # Every extra rendering comes from this same report object, before the
+    # baseline is updated below, so all of them describe the same scan and
+    # carry the same drift findings.
+    for fmt, path in extra_outputs:
+        _write_report(report, path, fmt)
 
     if not args.no_save:
         try:
@@ -202,6 +224,28 @@ def cmd_validate(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _parse_extra_outputs(values: list[str]) -> list[tuple[str, str]]:
+    """Validate ``--extra-output FORMAT:PATH`` arguments.
+
+    Split on the first colon only, so a path may contain further ones.
+    """
+    outputs: list[tuple[str, str]] = []
+    for value in values:
+        raw_format, separator, raw_path = str(value).partition(":")
+        fmt = raw_format.strip().lower()
+        path = raw_path.strip()
+        if not separator or not fmt or not path:
+            raise ValidationError(f"--extra-output expects FORMAT:PATH, got {value!r}")
+        if fmt not in FORMATS:
+            raise ValidationError(
+                f"--extra-output has unknown format {fmt!r} (expected one of: {', '.join(FORMATS)})"
+            )
+        if path == "-":
+            raise ValidationError("--extra-output cannot write to stdout; use -o for that")
+        outputs.append((fmt, path))
+    return outputs
+
+
 def _write_report(report: ScanReport, output: str, fmt: str) -> None:
     rendered = render(report, fmt)
     if output == "-":
@@ -212,7 +256,16 @@ def _write_report(report: ScanReport, output: str, fmt: str) -> None:
 
     path = Path(output).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(rendered, encoding="utf-8")
+    # 0600, for the same reason the state file is: the JSON rendering embeds
+    # the full snapshot, which is an inventory of your domains, mail routing
+    # and certificate metadata. Inheriting the process umask would leave that
+    # inventory world-readable on a shared host or a multi-tenant runner.
+    handle = os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8")
+    with handle:
+        handle.write(rendered)
+    # O_CREAT leaves the mode of an already-existing file alone, and a report
+    # path is usually reused run after run, so set it explicitly too.
+    os.chmod(path, 0o600)
     log.info("wrote %s report to %s", fmt, path)
 
 

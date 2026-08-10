@@ -22,10 +22,10 @@ Include what you can: affected version, reproduction steps, and impact. I aim to
 | **Code execution via config** — a YAML file instantiates Python objects | `yaml.safe_load` only; config size is capped; unknown keys are a hard error |
 | **Secret leakage into logs or reports** | Secrets are read from the environment, never stored in config or state. A logging filter redacts credential-shaped strings, and `httpx`'s URL-logging is suppressed |
 | **Secret leakage into a committed config** | A `*_url_env` field containing `://` is rejected outright, so pasting a webhook URL where an env var name belongs fails loudly |
-| **Prompt injection via DNS records** (when the AI layer is enabled) | The model runs after all findings and the exit code are final and cannot change them. Its output is prose that no code parses. Input is fenced and framed as untrusted |
+| **Prompt injection via DNS records** (when the AI layer is enabled) | The model runs after all findings and the exit code are final and cannot change them. Its output is prose that no code parses. Input is fenced and framed as untrusted. The summary is rendered with line-leading markup escaped, so a coerced reply cannot open a heading, list or table and pass itself off as a section of the deterministic report |
 | **Resource exhaustion** — a hostile domain returns enormous answers | Per-RRset record caps, per-record length caps, an 8 MiB HTTP response cap enforced **while streaming** (a chunked response cannot buffer past it first), a 5 MiB config cap, a 50 MiB state cap, and a bounded worker pool |
 | **State corruption** — an interrupted run truncates the baseline, silently disabling drift detection | Atomic write: temp file in the same directory, `fsync`, `chmod 0600`, then `os.replace` |
-| **Alert-channel injection** — a crafted DNS record or certificate SAN forges a line in your Slack alert or Markdown report | Certificate fields are sanitised at extraction; control characters are collapsed and angle brackets escaped in both the Slack and Markdown renderers, so a newline cannot forge a fake "all checks passed" line |
+| **Alert-channel injection** — a crafted DNS record or certificate SAN forges a line in your Slack alert or Markdown report | Certificate fields are sanitised at extraction; control characters are collapsed and angle brackets escaped in both the Slack and Markdown renderers, so a newline cannot forge a fake "all checks passed" line. The Markdown renderer also escapes `[` and `]`, so an issuer name of `Example CA [renew now](https://attacker.example)` cannot borrow the report's credibility for a link |
 | **False findings from partial data** — a truncated RRset or a failed lookup read as "the record was removed" | Truncated answers and partially-failed multi-lookup checks set an error and are not persisted; only NXDOMAIN counts as a dangling CNAME; a scan where most checks failed exits 2 rather than reporting clean |
 
 ### Explicitly out of scope
@@ -53,11 +53,11 @@ The compensating controls:
 - CI runs `pip-audit` against the dependency tree on every push and on a weekly schedule.
 - Workflow `permissions` are minimal and declared explicitly per job — the default is `contents: read`, and jobs opt in to more.
 - Dependabot is enabled for both pip and GitHub Actions.
-- GitHub Actions are currently pinned to **major version tags**, not commit SHAs. Tags are mutable, so this is weaker than SHA pinning; moving to SHAs is tracked as an open issue and is a welcome contribution.
+- GitHub Actions are pinned to **commit SHAs**, with the readable tag kept in a trailing comment. A tag is mutable and an action runs with the job's token and its secrets, so a tag on its own is not a pin. Dependabot still proposes the upgrades — it rewrites the SHA and the comment together.
 
 ## Running it safely
 
 - Give the CI job the narrowest network egress you can.
 - Store webhook URLs and API keys as CI secrets; never put them in `domains.yml`.
-- If you commit the state file for baseline persistence (as the example workflow does), remember it contains an inventory of your domains, mail routing, and certificate metadata. That is not secret, but it is a useful map for an attacker. Use a private repository.
+- If you commit the state file for baseline persistence (as the example workflow does), remember it contains an inventory of your domains, mail routing, and certificate metadata. That is not secret, but it is a useful map for an attacker. Use a private repository. The same applies to the JSON rendering of a report, which embeds the whole snapshot; both the state file and every report file are written `0600` rather than at the process umask.
 - Keep `ai.enabled: false` unless you have accepted sending your domain inventory to a third-party API.

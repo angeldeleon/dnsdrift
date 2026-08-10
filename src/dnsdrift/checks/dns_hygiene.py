@@ -63,6 +63,17 @@ _TAKEOVER_PRONE_SUFFIXES = (
 )
 
 
+def _is_subdomain_of(name: str, suffix: str) -> bool:
+    """True when *name* is *suffix* itself or a name beneath it.
+
+    The label boundary is the whole point. A plain ``endswith`` also matches
+    ``notgithub.io`` against ``github.io``, which promotes a dangling record on
+    a domain nobody can claim to CRITICAL — and a takeover alert that turns out
+    to be a substring collision is how a check stops being believed.
+    """
+    return name == suffix or name.endswith(f".{suffix}")
+
+
 def _error(check: str, domain: str, message: str) -> CheckResult:
     return CheckResult(
         check=check,
@@ -304,7 +315,7 @@ def check_cname(ctx: CheckContext) -> CheckResult:
             continue
 
         dangling.append(candidate)
-        prone = next((s for s in _TAKEOVER_PRONE_SUFFIXES if target.endswith(s)), None)
+        prone = next((s for s in _TAKEOVER_PRONE_SUFFIXES if _is_subdomain_of(target, s)), None)
         findings.append(
             Finding(
                 domain=domain,
