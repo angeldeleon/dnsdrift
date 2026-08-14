@@ -7,7 +7,9 @@ re-opens a known hole.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -568,3 +570,312 @@ class TestDeprecatedProtocolReporting:
         assert MINIMUM_PROTOCOL is ssl.TLSVersion.TLSv1
         assert "SSLv3" not in _DEPRECATED_PROTOCOLS
         assert set(_DEPRECATED_PROTOCOLS) == {"TLSv1", "TLSv1.1"}
+
+
+class TestStateFileIsOpenedThroughADescriptor:
+    """The state path is usually relative, so in CI it sits in the checked-out repo."""
+
+    def test_a_symlinked_state_file_is_refused(self, tmp_path) -> None:
+        from dnsdrift.store import SnapshotStore, StateError
+
+        target = tmp_path / "target.json"
+        target.write_text('{"version": 1, "snapshots": {}}', encoding="utf-8")
+        link = tmp_path / "state.json"
+        link.symlink_to(target)
+
+        with pytest.raises(StateError, match="cannot open state file"):
+            SnapshotStore(link).load()
+
+    def test_a_fifo_state_file_fails_rather_than_hanging(self, tmp_path) -> None:
+        """O_NONBLOCK is the difference between a failure and a hung cron job."""
+        import os
+
+        from dnsdrift.store import SnapshotStore, StateError
+
+        path = tmp_path / "state.json"
+        os.mkfifo(path)
+
+        with pytest.raises(StateError, match="not a regular file"):
+            SnapshotStore(path).load()
+
+    def test_a_permissive_state_file_is_tightened(self, tmp_path) -> None:
+        import stat as stat_module
+
+        from dnsdrift.store import SnapshotStore
+
+        path = tmp_path / "state.json"
+        path.write_text('{"version": 1, "snapshots": {}}', encoding="utf-8")
+        path.chmod(0o644)
+
+        SnapshotStore(path).load()
+        assert stat_module.S_IMODE(path.stat().st_mode) == 0o600
+
+    def test_a_missing_state_file_is_still_just_a_first_run(self, tmp_path) -> None:
+        from dnsdrift.store import SnapshotStore
+
+        assert SnapshotStore(tmp_path / "absent.json").load() == {}
+
+    def test_a_corrupt_state_file_still_degrades_rather_than_raising(self, tmp_path) -> None:
+        from dnsdrift.store import SnapshotStore
+
+        path = tmp_path / "state.json"
+        path.write_text("{not json", encoding="utf-8")
+        assert SnapshotStore(path).load() == {}
+
+
+class TestReportPathIsNotFollowed:
+    """A report is written into a shared artefact directory on a build agent."""
+
+    def test_a_symlinked_output_path_is_refused(self, tmp_path) -> None:
+        from dnsdrift.cli import _write_report
+        from dnsdrift.models import ScanReport
+
+        target = tmp_path / "victim.txt"
+        target.write_text("original", encoding="utf-8")
+        link = tmp_path / "report.md"
+        link.symlink_to(target)
+
+        with pytest.raises(ValidationError, match="cannot write report"):
+            _write_report(
+                ScanReport(started_at="t", finished_at="t", tool_version="0"), str(link), "markdown"
+            )
+
+        assert target.read_text(encoding="utf-8") == "original"
+
+    def test_the_symlink_target_is_not_chmodded(self, tmp_path) -> None:
+        """The chmod is the second half of the attack: it locks the owner out."""
+        import stat as stat_module
+
+        from dnsdrift.cli import _write_report
+        from dnsdrift.models import ScanReport
+
+        target = tmp_path / "victim.txt"
+        target.write_text("original", encoding="utf-8")
+        target.chmod(0o644)
+        link = tmp_path / "report.md"
+        link.symlink_to(target)
+
+        with pytest.raises(ValidationError):
+            _write_report(
+                ScanReport(started_at="t", finished_at="t", tool_version="0"), str(link), "markdown"
+            )
+
+        assert stat_module.S_IMODE(target.stat().st_mode) == 0o644
+
+
+class TestBareUrlQuarantine:
+    """A TXT record or certificate subject needs no metacharacter to phish."""
+
+    def test_a_bare_url_is_moved_into_a_code_span(self) -> None:
+        from dnsdrift.report import _md
+
+        rendered = _md("Verify your domain at https://attacker.example/dns")
+        assert "`https://attacker.example/dns`" in rendered
+
+    def test_a_www_url_is_quarantined_too(self) -> None:
+        from dnsdrift.report import _md
+
+        assert "`www.attacker.example/dns`" in _md("go to www.attacker.example/dns")
+
+    def test_a_finding_detail_cannot_autolink(self) -> None:
+        from dnsdrift.models import Finding, FindingKind, ScanReport
+        from dnsdrift.report import render_markdown
+
+        finding = Finding(
+            domain="example.com",
+            check="tls",
+            kind=FindingKind.POSTURE,
+            severity=Severity.MEDIUM,
+            title="TLS certificate issuer changed",
+            detail="Renew at https://attacker.example/renew immediately.",
+        )
+        rendered = render_markdown(
+            ScanReport(started_at="t", finished_at="t", tool_version="0", findings=[finding])
+        )
+        assert "`https://attacker.example/renew`" in rendered
+
+    def test_tool_authored_punctuation_is_not_escaped(self) -> None:
+        """Over-escaping is its own failure: nobody trusts a report that cannot punctuate."""
+        from dnsdrift.report import _md
+
+        assert _md("SPF permits all senders (+all)") == "SPF permits all senders (+all)"
+        assert _md("2 certificate(s) issued") == "2 certificate(s) issued"
+
+    def test_a_backtick_cannot_open_a_span(self) -> None:
+        from dnsdrift.report import _md
+
+        assert _md("issuer ` inject") == "issuer \\` inject"
+
+
+class TestEvidenceIsScrubbedAtSerialisation:
+    """Evidence is built from records a domain publishes, and rendered four ways."""
+
+    def test_a_credential_shaped_key_is_redacted(self) -> None:
+        from dnsdrift.models import Finding, FindingKind
+        from dnsdrift.validation import REDACTED
+
+        finding = Finding(
+            domain="example.com",
+            check="spf",
+            kind=FindingKind.POSTURE,
+            severity=Severity.LOW,
+            title="t",
+            detail="d",
+            evidence={"record": "v=spf1 -all", "api_key": "AKIAIOSFODNN7EXAMPLE"},
+        )
+        out = finding.to_dict()
+        assert out["evidence"]["api_key"] == REDACTED
+        assert out["evidence"]["record"] == "v=spf1 -all"
+        assert "AKIAIOSFODNN7EXAMPLE" not in json.dumps(out)
+
+    def test_a_huge_record_set_is_bounded(self) -> None:
+        from dnsdrift.models import Finding, FindingKind
+
+        finding = Finding(
+            domain="example.com",
+            check="spf",
+            kind=FindingKind.POSTURE,
+            severity=Severity.LOW,
+            title="t",
+            detail="d",
+            evidence={"records": ["x" * 4096 for _ in range(100)]},
+        )
+        records = finding.to_dict()["evidence"]["records"]
+        assert len(records) == 51
+        assert records[-1].endswith("more")
+        assert all(len(r) <= 400 for r in records[:50])
+
+
+class TestSerialisedReportIsBounded:
+    def test_findings_are_capped_and_the_total_stays_whole(self) -> None:
+        from dnsdrift.models import MAX_SERIALISED_FINDINGS as cap
+        from dnsdrift.models import Finding, FindingKind, ScanReport
+
+        findings = [
+            Finding(
+                domain="example.com",
+                check="spf",
+                kind=FindingKind.POSTURE,
+                severity=Severity.LOW,
+                title=f"t{i}",
+                detail="d",
+            )
+            for i in range(cap + 5)
+        ]
+        out = ScanReport(started_at="t", finished_at="t", tool_version="0", findings=findings).to_dict()
+        assert len(out["findings"]) == cap
+        assert out["findings_total"] == cap + 5
+        assert out["findings_truncated"] is True
+
+    def test_markdown_rendering_is_capped(self) -> None:
+        from dnsdrift.models import Finding, FindingKind, ScanReport
+        from dnsdrift.report import MAX_RENDERED_FINDINGS as cap
+        from dnsdrift.report import render_markdown
+
+        findings = [
+            Finding(
+                domain="example.com",
+                check="spf",
+                kind=FindingKind.POSTURE,
+                severity=Severity.LOW,
+                title=f"finding number {i}",
+                detail="d",
+            )
+            for i in range(cap + 3)
+        ]
+        rendered = render_markdown(
+            ScanReport(started_at="t", finished_at="t", tool_version="0", findings=findings)
+        )
+        assert "3 further finding(s) were not rendered" in rendered
+        assert f"finding number {cap + 2}" not in rendered
+
+
+class TestNotificationPayloadsAreBounded:
+    def test_the_generic_webhook_payload_is_capped(self, monkeypatch) -> None:
+        from dnsdrift import notify as notify_module
+        from dnsdrift.models import Finding, FindingKind, ScanReport
+
+        captured: dict = {}
+
+        class _Response:
+            status_code = 200
+
+        def fake_request(method, url, **kwargs):
+            captured.update(kwargs["json_body"])
+            return _Response()
+
+        monkeypatch.setattr(notify_module, "safe_request", fake_request)
+
+        findings = [
+            Finding(
+                domain="example.com",
+                check="spf",
+                kind=FindingKind.POSTURE,
+                severity=Severity.HIGH,
+                title=f"t{i}",
+                detail="d",
+            )
+            for i in range(notify_module._MAX_WEBHOOK_FINDINGS + 10)
+        ]
+        report = ScanReport(started_at="t", finished_at="t", tool_version="0", findings=findings)
+        notify_module._post_generic("https://hook.example/x", report, findings, user_agent="dnsdrift")
+
+        assert len(captured["findings"]) == notify_module._MAX_WEBHOOK_FINDINGS
+        assert captured["findings_total"] == notify_module._MAX_WEBHOOK_FINDINGS + 10
+        assert captured["findings_truncated"] is True
+
+
+class TestSlackRendersUntrustedTextWhereMarkupIsNotInterpreted:
+    """Slack mrkdwn has no backslash escape, so escaping cannot be the control."""
+
+    def test_the_title_and_detail_go_in_a_plain_text_block(self, monkeypatch) -> None:
+        from dnsdrift import notify as notify_module
+        from dnsdrift.models import Finding, FindingKind, ScanReport
+
+        captured: dict = {}
+
+        class _Response:
+            status_code = 200
+
+        def fake_request(method, url, **kwargs):
+            captured.update(kwargs["json_body"])
+            return _Response()
+
+        monkeypatch.setattr(notify_module, "safe_request", fake_request)
+
+        finding = Finding(
+            domain="example.com",
+            check="tls",
+            kind=FindingKind.POSTURE,
+            severity=Severity.HIGH,
+            title="*RESOLVED* :white_check_mark: nothing to see",
+            detail="issued by `evil` CA",
+        )
+        report = ScanReport(started_at="t", finished_at="t", tool_version="0", findings=[finding])
+        notify_module._post_slack("https://hooks.example/x", report, [finding], user_agent="dnsdrift")
+
+        body = [b for b in captured["blocks"] if b.get("text", {}).get("type") == "plain_text"]
+        assert body, "the untrusted half of the message must not be mrkdwn"
+        assert body[0]["text"]["emoji"] is False
+        assert "*RESOLVED*" in body[0]["text"]["text"]
+
+    def test_a_backtick_cannot_close_the_code_span_around_the_domain(self) -> None:
+        from dnsdrift.notify import _escape_code
+
+        assert "`" not in _escape_code("example.com` *now*")
+
+
+class TestADevicePathIsStillWritable:
+    """`-o /dev/null` is a reasonable thing to write in a pipeline that only
+    wants the exit code. The 0600 is for a real file; chmod-ing a character
+    device is either a permission error or, as root, a machine-wide change."""
+
+    def test_writing_to_dev_null_neither_fails_nor_chmods_it(self) -> None:
+        import stat as stat_module
+
+        from dnsdrift.cli import _write_report
+        from dnsdrift.models import ScanReport
+
+        before = stat_module.S_IMODE(os.stat("/dev/null").st_mode)
+        _write_report(ScanReport(started_at="t", finished_at="t", tool_version="0"), "/dev/null", "json")
+        assert stat_module.S_IMODE(os.stat("/dev/null").st_mode) == before

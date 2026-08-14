@@ -42,12 +42,20 @@ _SARIF_RANK = {
     Severity.INFO: 5.0,
 }
 
+# Renderer-level caps. The model already bounds what it serialises; these bound
+# what a human is asked to read, which is a smaller number. A scan of five
+# thousand domains that each lost DNSSEC must not produce a Markdown file nobody
+# can open, because the run that found the most would then be the least useful.
+MAX_RENDERED_FINDINGS = 400
+_MAX_RENDERED_REFERENCES = 5
+
 
 def render_markdown(report: ScanReport, *, include_info: bool = True) -> str:
     """Render a human-readable report."""
     lines: list[str] = []
     counts = report.counts_by_severity()
-    findings = [f for f in report.findings if include_info or f.severity > Severity.INFO]
+    selected = [f for f in report.findings if include_info or f.severity > Severity.INFO]
+    findings = selected[:MAX_RENDERED_FINDINGS]
 
     lines.append("# dnsdrift report")
     lines.append("")
@@ -102,6 +110,13 @@ def render_markdown(report: ScanReport, *, include_info: bool = True) -> str:
         lines.append("")
         lines.extend(_render_findings(operational))
 
+    if len(selected) > len(findings):
+        lines.append(
+            f"_{len(selected) - len(findings)} further finding(s) were not rendered; "
+            "the JSON output carries the full set up to its own cap._"
+        )
+        lines.append("")
+
     if not findings:
         lines.append("No findings. Every configured check passed.")
         lines.append("")
@@ -113,6 +128,41 @@ def render_markdown(report: ScanReport, *, include_info: bool = True) -> str:
 
 
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+# Markdown metacharacters that let attacker-chosen text do more than render as
+# text. Two kinds:
+#
+# * ``[`` and ``]`` build a link. A certificate issuer of
+#   ``Example CA [renew now](https://attacker.example)`` would otherwise render
+#   as a hyperlink inside a report that reads as though the scanner put it
+#   there, which is exactly the credibility a phish wants to borrow. Escaping
+#   the brackets kills the inline link, the reference link and the image, since
+#   all three need one.
+# * The backtick opens a code span. On its own that only changes how a run of
+#   text is typeset, but it also lets a crafted record close a span this file
+#   opened around a value and continue as live markup.
+#
+# Parentheses and ``!`` are deliberately NOT escaped, and neither are the
+# emphasis markers. Without an unescaped ``[`` a paren is inert — there is no
+# link target for it to open — and escaping them would print
+# ``SPF permits all senders \(+all\)`` and ``certificate\(s\)`` at the reader on
+# almost every finding this tool writes, because those titles are written here
+# and quote DMARC and SPF syntax. A report that cannot punctuate teaches its
+# reader that the tool is careless, which costs more than it buys.
+_MD_ESCAPE_RE = re.compile(r"([`\[\]])")
+
+# A bare URL needs none of the metacharacters above. GitHub-flavoured Markdown,
+# and most of the ticket systems a report gets pasted into, autolink
+# ``https://…`` and ``www.…`` on sight — so a TXT record or certificate subject
+# reading ``verify your domain at https://attacker.example/dns`` still puts a
+# live phishing link in the finding line an analyst reads, which is the outcome
+# the escaping above exists to prevent, reached without a single escapable
+# character. Escaping cannot fix it: the autolinker matches the shape of the
+# text, not a metacharacter. Autolinking never happens inside a code span in any
+# CommonMark implementation, so a URL-shaped run is moved into one instead. The
+# run stops at whitespace and at a backtick, so the span it opens always closes.
+_BARE_URL_RE = re.compile(r"(?i)(?:[a-z][a-z0-9+.-]*:/{2}|www\.|mailto:|xmpp:)[^\s`]*")
 
 
 def _md(text: str) -> str:
@@ -127,30 +177,78 @@ def _md(text: str) -> str:
     return _escape_md(" ".join(_CONTROL_CHARS_RE.sub(" ", str(text)).split()))
 
 
+def _escape_run(text: str) -> str:
+    """Escape the Markdown metacharacters in a run of ordinary text."""
+    return _MD_ESCAPE_RE.sub(r"\\\1", text).replace("<", "&lt;")
+
+
 def _escape_md(line: str) -> str:
-    """Escape the characters that actually carry meaning in rendered Markdown.
+    """Escape one already-collapsed line, quarantining any URL-shaped run.
 
-    Three of them:
-
-    * ``<`` can open an HTML tag, so it is always escaped.
-    * ``[`` and ``]`` build a link. A certificate issuer of
-      ``Example CA [renew now](https://attacker.example)`` would otherwise
-      render as a hyperlink inside a report that reads as though the scanner
-      put it there, which is exactly the credibility a phish wants to borrow.
-    * ``>`` is only significant at the start of a line, where it begins a
-      blockquote — escaping it everywhere would render every
-      "p=reject -> p=none" as "-&gt;".
+    ``<`` is always escaped because it opens an HTML tag. ``>`` is significant
+    only at the start of a line, where it begins a blockquote — escaping it
+    everywhere would render every "p=reject -> p=none" as "-&gt;".
     """
-    escaped = line.replace("<", "&lt;").replace("[", "\\[").replace("]", "\\]")
+    out: list[str] = []
+    position = 0
+    for match in _BARE_URL_RE.finditer(line):
+        out.append(_escape_run(line[position : match.start()]))
+        # Entity-escaped inside the span for the reason :func:`_code` gives: a
+        # renderer that mishandles code spans should not be the only thing
+        # standing between a record somebody else publishes and an ``<img>``.
+        out.append("`" + match.group().replace("<", "&lt;").replace(">", "&gt;") + "`")
+        position = match.end()
+    out.append(_escape_run(line[position:]))
+
+    escaped = "".join(out)
     if escaped.startswith(">"):
         escaped = "&gt;" + escaped[1:]
     return escaped
 
 
+def _code(text: str) -> str:
+    """Prepare a value for rendering inside a Markdown code span.
+
+    Backslash escapes are inert inside backticks, so running :func:`_md` here
+    would print the backslashes literally — ``Example CA \\(EU\\)`` instead of
+    ``Example CA (EU)``. Parentheses, brackets and ``!`` are harmless inside a
+    code span and common in real issuer names, so they are left alone.
+
+    Two characters are still handled. The backtick would close the span, so it
+    is replaced rather than escaped. ``<`` and ``>`` are entity-escaped even
+    though a CommonMark-compliant renderer already escapes HTML inside a code
+    span: reports get pasted into whatever a team happens to use, and a renderer
+    that mishandles code spans should not be the only thing standing between an
+    attacker-chosen certificate subject and an ``<img>`` tag.
+    """
+    collapsed = " ".join(_CONTROL_CHARS_RE.sub(" ", str(text)).split())
+    return collapsed.replace("`", "'").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _md_url(value: object) -> str:
+    """Render a reference URL, or drop it if it is not a plain http(s) link.
+
+    Every reference shipped today is an RFC or a project page written in this
+    repository, so nothing is expected to be dropped here. It is a guard against
+    the next check that builds a reference from something a domain published: a
+    value containing ``)`` would break out of the link target and the rest of it
+    would render as report text.
+    """
+    text = " ".join(_CONTROL_CHARS_RE.sub(" ", str(value)).split())
+    if not text.startswith(("https://", "http://")):
+        return ""
+    if any(ch in text for ch in "()<>[]` "):
+        return ""
+    return text
+
+
 # Characters that mean nothing mid-line but open a block when they start one:
-# headings, list bullets, block quotes, table rows, thematic breaks, setext
-# underlines and code fences.
-_LEADING_MARKUP_CHARS = frozenset("#>*+-=|`~_")
+# headings, list bullets, block quotes, table rows, thematic breaks and setext
+# underlines. The backtick is deliberately absent: a literal one has already
+# been escaped by _MD_ESCAPE_RE, so the only line that can still begin with a
+# bare backtick is one whose first run was a quarantined URL — and prefixing a
+# backslash there would break the very code span that stops it autolinking.
+_LEADING_MARKUP_CHARS = frozenset("#>*+-=|~_")
 
 # "1." and "1)" both start an ordered list. The escape has to land on the
 # punctuation, not the digit — a backslash before a digit is just a backslash.
@@ -213,17 +311,18 @@ def _render_findings(findings: list[Any]) -> list[str]:
     for finding in findings:
         if finding.domain != current_domain:
             current_domain = finding.domain
-            lines.append(f"### `{_md(current_domain)}`")
+            lines.append(f"### `{_code(current_domain)}`")
             lines.append("")
         emoji = _SEVERITY_EMOJI[finding.severity]
         lines.append(f"{emoji} **{finding.severity.value.upper()} — {_md(finding.title)}**  ")
-        lines.append(f"`{finding.check}` · {_md(finding.detail)}")
+        lines.append(f"`{_code(finding.check)}` · {_md(finding.detail)}")
         if finding.remediation:
             lines.append("")
             lines.append(f"> **Fix:** {_md(finding.remediation)}")
-        if finding.references:
+        urls = [u for u in (_md_url(r) for r in finding.references[:_MAX_RENDERED_REFERENCES]) if u]
+        if urls:
             lines.append("")
-            lines.append("> " + " · ".join(f"[ref]({r})" for r in finding.references))
+            lines.append("> " + " · ".join(f"[ref]({u})" for u in urls))
         lines.append("")
     return lines
 
