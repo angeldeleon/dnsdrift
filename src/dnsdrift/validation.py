@@ -25,6 +25,8 @@ from __future__ import annotations
 import ipaddress
 import re
 import socket
+from collections.abc import Mapping
+from typing import Any
 from urllib.parse import urlsplit
 
 __all__ = [
@@ -34,6 +36,8 @@ __all__ = [
     "normalize_selector",
     "assert_public_http_url",
     "resolve_public_ips",
+    "scrub_evidence",
+    "REDACTED",
     "_is_public_address",
 ]
 
@@ -133,6 +137,82 @@ def normalize_domain(value: str) -> str:
             )
 
     return encoded
+
+
+REDACTED = "<redacted>"
+
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+# Keys whose value must never be persisted, rendered or forwarded. Matched as a
+# substring of the lowercased key, so `apiKeyRecord` and `client_secret` are
+# both caught. Deliberately broad: the cost of redacting a harmless field is a
+# less informative evidence blob, and the cost of missing one is a credential in
+# a Slack channel — and a TXT record is a place people really do publish one,
+# usually a service-verification token they were told to paste in and never
+# removed.
+_SECRET_KEY_RE = re.compile(
+    r"(?i)(secret|password|passwd|private[_-]?key|api[_-]?key|apikey|\bkey\b|keyvalue|"
+    r"token|bearer|authorization|cookie|credential)"
+)
+
+# Evidence is serialised into a JSON report and a webhook payload. A domain
+# publishing a hundred 4 KiB TXT records is inside every per-record cap the
+# resolver enforces and still produces a request the receiver drops, so the
+# structure itself is bounded here as well.
+_MAX_EVIDENCE_KEYS = 40
+_MAX_EVIDENCE_ITEMS = 50
+_MAX_EVIDENCE_DEPTH = 4
+_MAX_EVIDENCE_VALUE = 400
+
+
+def _evidence_text(value: object, *, limit: int) -> str:
+    """Collapse and cap one leaf value from a DNS answer or a certificate."""
+    text = " ".join(_CONTROL_CHARS_RE.sub(" ", str(value)).split())
+    if len(text) > limit:
+        text = text[: limit - 1] + "…"
+    return text
+
+
+def scrub_evidence(raw: Any, *, _depth: int = 0) -> Any:
+    """Strip credential-shaped values from a structure at construction time.
+
+    Redaction belongs here rather than in the renderers. There are four output
+    sinks today — Markdown, JSON, SARIF, webhook — and the fifth one somebody
+    adds will not remember to redact. A finding that never *holds* a secret
+    cannot leak one however it is rendered, so the value is dropped when the
+    finding is serialised and the key is kept, because "this domain publishes a
+    record called `api_key`" is exactly the fact worth reporting.
+
+    Also bounds the structure, for the reason given on the caps above.
+    """
+    if _depth > _MAX_EVIDENCE_DEPTH:
+        return "<truncated>"
+
+    if isinstance(raw, Mapping):
+        out: dict[str, Any] = {}
+        for index, (key, value) in enumerate(raw.items()):
+            if index >= _MAX_EVIDENCE_KEYS:
+                out["_truncated"] = f"{len(raw) - _MAX_EVIDENCE_KEYS} further key(s) omitted"
+                break
+            name = _evidence_text(key, limit=80)
+            if _SECRET_KEY_RE.search(name):
+                out[name] = REDACTED
+                continue
+            out[name] = scrub_evidence(value, _depth=_depth + 1)
+        return out
+
+    if isinstance(raw, (list, tuple, set, frozenset)):
+        items = list(raw)
+        scrubbed = [scrub_evidence(item, _depth=_depth + 1) for item in items[:_MAX_EVIDENCE_ITEMS]]
+        if len(items) > _MAX_EVIDENCE_ITEMS:
+            scrubbed.append(f"…and {len(items) - _MAX_EVIDENCE_ITEMS} more")
+        return scrubbed
+
+    if isinstance(raw, bool) or raw is None:
+        return raw
+    if isinstance(raw, (int, float)):
+        return raw
+    return _evidence_text(raw, limit=_MAX_EVIDENCE_VALUE)
 
 
 def normalize_selector(value: str) -> str:

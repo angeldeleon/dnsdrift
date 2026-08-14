@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
+from .validation import scrub_evidence
+
 
 class Severity(str, Enum):
     """Finding severity, ordered.
@@ -115,6 +117,11 @@ class Finding:
         out["kind"] = self.kind.value
         out["severity"] = self.severity.value
         out["references"] = list(self.references)
+        # Scrubbed here, at the one place every sink goes through, rather than
+        # in each renderer. Evidence is built from records a domain publishes,
+        # and for the domains this tool is most useful on, that is somebody
+        # else's choice of content and length.
+        out["evidence"] = scrub_evidence(self.evidence)
         out["fingerprint"] = self.fingerprint
         return out
 
@@ -189,6 +196,13 @@ class Snapshot:
         )
 
 
+# Serialisation caps. `config.domains` allows 5000 entries and each domain runs
+# nine checks, so both of these are far above any healthy run and well below the
+# point where a JSON report stops being a file anybody can open.
+MAX_SERIALISED_FINDINGS = 2000
+MAX_SERIALISED_SNAPSHOTS = 5000
+
+
 @dataclass(slots=True)
 class ScanReport:
     """Everything one `dnsdrift scan` produced."""
@@ -233,6 +247,13 @@ class ScanReport:
         return counts
 
     def to_dict(self) -> dict[str, Any]:
+        # Bounded, and the counts above the cap stay whole so a consumer can
+        # always tell it is looking at a subset. A scan of a few thousand
+        # domains that each lost DNSSEC would otherwise serialise a document no
+        # webhook receiver accepts, which would make the run that found the most
+        # the one that reported least.
+        findings = self.findings[:MAX_SERIALISED_FINDINGS]
+        snapshots = self.snapshots[:MAX_SERIALISED_SNAPSHOTS]
         return {
             "tool": "dnsdrift",
             "tool_version": self.tool_version,
@@ -244,8 +265,11 @@ class ScanReport:
             "checks_failed": self.checks_failed,
             "scan_degraded": self.scan_degraded,
             "counts_by_severity": self.counts_by_severity(),
-            "findings": [f.to_dict() for f in self.findings],
-            "snapshots": [s.to_dict() for s in self.snapshots],
+            "findings": [f.to_dict() for f in findings],
+            "findings_total": len(self.findings),
+            "findings_truncated": len(self.findings) > len(findings),
+            "snapshots": [s.to_dict() for s in snapshots],
+            "snapshots_truncated": len(self.snapshots) > len(snapshots),
             "ai_summary": self.ai_summary,
         }
 

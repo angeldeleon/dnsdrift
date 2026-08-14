@@ -6,7 +6,76 @@ Notable changes to dnsdrift, newest first. Format follows
 
 ## [Unreleased]
 
+A cross-tool consistency pass. Each of the checks below is one this repository
+never claimed to make, which is exactly why nothing caught them: a review that
+reads a tool against its own documentation can only find the promises it broke,
+not the ones it never made.
+
 ### Fixed
+
+- **The state file is opened through a descriptor that refuses a symlink and a
+  named pipe.** It was read with `path.exists()` followed by `read_text()` —
+  two lookups of the same name, with whoever can write that directory in
+  control of what happens in between. The default state path is relative, so on
+  CI it lands inside the checked-out repository. A symlink there redirected the
+  read and then, through `save()`, the write; a FIFO there blocked the run
+  forever, with no timeout and nothing in the log, because nothing was checking
+  the file type until after the open. Every open now carries `O_NOFOLLOW` and
+  `O_NONBLOCK`, the descriptor is `fstat`ed before a byte is read, and a
+  world-readable state file is tightened through the descriptor rather than by
+  path. A corrupt file still degrades to "no baseline"; a symlink or a FIFO is
+  not a corruption and raises.
+- **The report path is no longer followed through a symlink.** Reports are
+  written `0600` because the JSON rendering embeds the whole snapshot, but the
+  open had no `O_NOFOLLOW` — so a link planted at `-o` on a shared build agent
+  redirected that inventory to a file the attacker could read, and the chmod
+  that followed tightened *their* target, locking its owner out of it. The open
+  refuses the link, and the mode is set through the descriptor rather than by
+  path.
+- **A bare URL in a DNS record or a certificate subject can no longer become a
+  link.** The Markdown escaper covered link *syntax*, and
+  `https://attacker.example/dns` uses none of it: GitHub-flavoured Markdown and
+  most ticket systems autolink it on sight, putting a live phishing link in a
+  finding line that reads as though the scanner wrote it. URL-shaped runs are
+  now rendered inside a code span, where no CommonMark implementation
+  autolinks. Escaping could not fix this one — the autolinker matches the shape
+  of the text, not a metacharacter. A backtick is escaped for the same reason,
+  so a crafted value cannot close a span this renderer opened. Parentheses are
+  still left alone deliberately: without an unescaped `[` they are inert, and
+  escaping them would print `SPF permits all senders \(+all\)` on findings
+  this repository writes itself.
+- **Evidence is redacted and bounded where the finding is serialised**, rather
+  than at each of the four sinks that render it. A TXT record is somewhere
+  people really do leave a service token they were told to paste in, and the
+  webhook payload carried the record set verbatim: a hundred 4 KiB records is
+  inside every per-record cap the resolver enforces and still produces a request
+  the receiver drops.
+- **Every serialised collection has a cap.** The JSON report serialised every
+  finding and every snapshot, and the generic webhook serialised every finding
+  at or above the threshold — so a large scan produced a document nobody could
+  open and a request nobody accepted, which made the run that found the most the
+  one that reported least. Counts and totals stay whole above the cap, so a
+  consumer can always tell it is looking at a subset.
+- **The Markdown report caps what it asks a human to read**, and says how many
+  findings it left out.
+- **Slack alerts put untrusted text where mrkdwn is not interpreted.** The
+  finding title and detail interpolate record contents and certificate subjects
+  — attacker-chosen for any domain you do not control — into an mrkdwn field,
+  where a value of `*RESOLVED* :white_check_mark:` formats itself inside the
+  alert. Slack mrkdwn has no backslash escape, so escaping was never going to be
+  the control: those two fields now go in a `plain_text` block with emoji
+  expansion off, and the domain and check name sit in a code span whose closing
+  backtick cannot be forged.
+- **The state file's temporary sibling is chmodded through its descriptor**
+  rather than by name.
+
+### Added
+
+- A `security invariants` CI job, matching the other tools in this family: no
+  write path into a domain, every `os.open` carrying `O_NOFOLLOW` and every read
+  `O_NONBLOCK`, every declared check implemented *and* diffed, a failed lookup
+  never reported as an absent record, and no live link, tag, autolink or
+  credential shape surviving into any report format.
 
 - **The monitor workflow died on the exit codes it existed to route.** Actions
   runs a `run:` block under `bash -e`, and `set -uo pipefail` adds flags without
